@@ -97,10 +97,14 @@ def _build_bnb_config(config: ModelConfig) -> BitsAndBytesConfig | None:
     """构建 BitsAndBytesConfig 用于 4-bit QLoRA 量化。"""
     if not config.load_in_4bit:
         return None
+    # 4-bit 量化需要 CUDA；CPU 模式下跳过
+    if not torch.cuda.is_available():
+        LOGGER.warning("未检测到 CUDA，跳过 4-bit 量化（将以 float32 加载模型）")
+        return None
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type=config.bnb_4bit_quant_type,
-        bnb_4bit_compute_dtype=torch.float16 if not config.load_in_4bit else torch.float16,
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=config.bnb_4bit_use_double_quant,
     )
 
@@ -168,6 +172,7 @@ def load_model(config: ModelConfig, tokenizer=None):
         model_config.text_config.num_labels = NUM_LABELS
         LOGGER.info("已手动将 num_labels=%s 传播到 text_config", NUM_LABELS)
 
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     try:
         model = AutoModelForSequenceClassification.from_pretrained(
             config.model_name,
@@ -176,7 +181,7 @@ def load_model(config: ModelConfig, tokenizer=None):
             trust_remote_code=True,
             cache_dir=config.cache_dir,
             local_files_only=config.local_files_only,
-            torch_dtype=torch.float16,
+            torch_dtype=dtype,
         )
     except OSError as exc:
         raise RuntimeError(
@@ -193,8 +198,8 @@ def load_model(config: ModelConfig, tokenizer=None):
     if not config.use_lora:
         return model
 
-    # QLoRA 特有步骤: 准备量化模型以适配训练
-    if config.load_in_4bit:
+    # QLoRA 特有步骤: 准备量化模型以适配训练（仅在实际量化时）
+    if config.load_in_4bit and torch.cuda.is_available():
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=True
         )

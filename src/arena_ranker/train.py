@@ -147,6 +147,20 @@ def describe_device(device: torch.device) -> str:
 def build_training_args(config: AppConfig) -> TrainingArguments:
     """从 AppConfig 构建 HuggingFace TrainingArguments。"""
     tc = config.training
+    has_cuda = torch.cuda.is_available()
+
+    # CPU 模式下自动调整不兼容的参数
+    optim = tc.optim
+    fp16 = tc.fp16
+    bf16 = tc.bf16
+    if not has_cuda:
+        if optim.startswith("paged_"):
+            optim = "adamw_torch"
+            LOGGER.warning("CPU 模式: 优化器从 %s 回退为 adamw_torch", tc.optim)
+        fp16 = False
+        bf16 = False
+        LOGGER.warning("CPU 模式: 已禁用 fp16/bf16 混合精度")
+
     return TrainingArguments(
         output_dir=tc.output_dir,
         learning_rate=tc.learning_rate,
@@ -155,11 +169,11 @@ def build_training_args(config: AppConfig) -> TrainingArguments:
         per_device_eval_batch_size=tc.per_device_eval_batch_size,
         gradient_accumulation_steps=tc.gradient_accumulation_steps,
         num_train_epochs=tc.num_train_epochs,
-        warmup_ratio=tc.warmup_ratio,
+        warmup_steps=tc.warmup_steps,
         lr_scheduler_type=tc.lr_scheduler_type,
-        optim=tc.optim,
-        fp16=tc.fp16,
-        bf16=tc.bf16,
+        optim=optim,
+        fp16=fp16,
+        bf16=bf16,
         gradient_checkpointing=tc.gradient_checkpointing,
         logging_steps=tc.logging_steps,
         eval_strategy=tc.eval_strategy,
@@ -211,11 +225,12 @@ def log_run_summary(
         train_size, valid_size,
     )
     LOGGER.info(
-        "训练参数: lr=%.1e, epochs=%s, batch=%s, grad_accum=%s, scheduler=%s",
+        "训练参数: lr=%.1e, epochs=%s, batch=%s, grad_accum=%s, scheduler=%s, warmup=%.2f",
         tc.learning_rate, tc.num_train_epochs,
         tc.per_device_train_batch_size,
         tc.gradient_accumulation_steps,
         tc.lr_scheduler_type,
+        tc.warmup_steps,
     )
     LOGGER.info("输出目录: %s", tc.output_dir)
     LOGGER.info("=" * 60)

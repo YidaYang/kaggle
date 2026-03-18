@@ -214,6 +214,12 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     """
     logits, labels = eval_pred
 
+    # 处理可能的 NaN（CPU 模式或数值不稳定时可能出现）
+    nan_mask = np.isnan(logits).any(axis=-1)
+    if nan_mask.any():
+        logits = np.copy(logits)
+        logits[nan_mask] = 0.0  # NaN 行替换为均匀分布
+
     # logits → 概率
     probs = _softmax(logits, axis=-1)
 

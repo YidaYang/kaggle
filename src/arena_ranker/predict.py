@@ -101,26 +101,29 @@ def normalize_probabilities(
 #  加载推理模型
 # ============================================================
 
-def load_inference_model(checkpoint_dir: Path, config):
+def load_inference_model(checkpoint_dir: Path, config, tokenizer):
     """
     加载训练好的 QLoRA 模型用于推理。
 
     步骤：
       1. 重新加载基座模型 (4-bit 量化)
       2. 从 adapter 目录加载 LoRA 权重 + score 分类头
+      3. 对齐 pad_token_id
     """
     mc = config.model
     adapter_dir = checkpoint_dir / "model"
 
-    # 量化配置
+    # 量化配置（4-bit 需要 CUDA）
     bnb_config = None
-    if mc.load_in_4bit:
+    if mc.load_in_4bit and torch.cuda.is_available():
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type=mc.bnb_4bit_quant_type,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=mc.bnb_4bit_use_double_quant,
         )
+    elif mc.load_in_4bit:
+        LOGGER.warning("未检测到 CUDA，跳过 4-bit 量化")
 
     # 加载配置并处理 VLM num_labels 传播
     model_config = AutoConfig.from_pretrained(
@@ -133,7 +136,14 @@ def load_inference_model(checkpoint_dir: Path, config):
     if hasattr(model_config, "text_config"):
         model_config.text_config.num_labels = NUM_LABELS
 
+    # 对齐 pad_token_id（分类模型需要）
+    if tokenizer.pad_token_id is not None:
+        model_config.pad_token_id = tokenizer.pad_token_id
+        if hasattr(model_config, "text_config"):
+            model_config.text_config.pad_token_id = tokenizer.pad_token_id
+
     # 加载基座模型
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     base_model = AutoModelForSequenceClassification.from_pretrained(
         mc.model_name,
         config=model_config,
@@ -141,7 +151,7 @@ def load_inference_model(checkpoint_dir: Path, config):
         trust_remote_code=True,
         cache_dir=mc.cache_dir,
         local_files_only=mc.local_files_only,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
     )
 
     # 加载 LoRA adapter
@@ -190,7 +200,7 @@ def main() -> None:
     tokenizer.padding_side = "left"
 
     # ---- 3. 加载模型 ----
-    model = load_inference_model(checkpoint_dir, config)
+    model = load_inference_model(checkpoint_dir, config, tokenizer)
 
     # ---- 4. 加载测试数据 ----
     test_csv = Path(args.data_dir) / config.data.test_path

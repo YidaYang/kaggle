@@ -94,7 +94,7 @@ class TrainingConfig:
     per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 8
     num_train_epochs: int = 3
-    warmup_ratio: float = 0.1
+    warmup_steps: float = 0.1
     lr_scheduler_type: str = "cosine"
     optim: str = "paged_adamw_32bit"
     fp16: bool = True
