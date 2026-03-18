@@ -1,0 +1,3 @@
+src/arena_ranker/__pycache__/
+train.csv
+test.csv
