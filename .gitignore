@@ -1,3 +1,6 @@
-src/arena_ranker/__pycache__/
+__pycache__/
+*.pyc
 train.csv
 test.csv
+artifacts/
+*.egg-info/
