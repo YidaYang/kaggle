@@ -17,6 +17,7 @@ from arena_ranker.modeling import PreferenceClassifier
 
 
 LOGGER = logging.getLogger("arena_ranker.predict")
+PROBABILITY_EPSILON = 1e-6
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +57,12 @@ def describe_device(device: torch.device) -> str:
     gpu_name = torch.cuda.get_device_name(device)
     total_memory_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
     return f"{gpu_name} ({total_memory_gb:.1f} GB)"
+
+
+def normalize_probabilities(logits: torch.Tensor, epsilon: float = PROBABILITY_EPSILON) -> torch.Tensor:
+    probs = torch.softmax(logits, dim=-1)
+    probs = probs.clamp(min=epsilon, max=1.0 - epsilon)
+    return probs / probs.sum(dim=-1, keepdim=True)
 
 
 def main() -> None:
@@ -106,7 +113,7 @@ def main() -> None:
                 response_a_inputs=move_inputs_to_device(batch.response_a, device),
                 response_b_inputs=move_inputs_to_device(batch.response_b, device),
             )
-            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+            probs = normalize_probabilities(outputs.logits).cpu().numpy()
             for sample_id, prob in zip(batch.ids, probs, strict=True):
                 rows.append(
                     {
