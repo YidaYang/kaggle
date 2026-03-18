@@ -66,7 +66,29 @@ export all_proxy="socks5://127.0.0.1:7890"
 
 训练集和测试集默认读取项目根目录下的 `train.csv`、`test.csv`。
 
-代码会从原始表中读取这些字段：
+### 训练集输入列
+
+代码会从训练集读取这些字段：
+
+- `id`
+- `prompt`
+- `response_a`
+- `response_b`
+- `winner_model_a`
+- `winner_model_b`
+- `winner_tie`
+
+其中：
+
+- `id`：样本唯一标识
+- `prompt`：用户问题或上下文
+- `response_a`：候选回答 A
+- `response_b`：候选回答 B
+- `winner_model_a` / `winner_model_b` / `winner_tie`：三分类 one-hot 标签，且每行必须恰好有一个值为 `1`
+
+### 测试集输入列
+
+代码会从测试集读取这些字段：
 
 - `id`
 - `prompt`
@@ -91,6 +113,205 @@ export all_proxy="socks5://127.0.0.1:7890"
 - 将多段文本按换行拼接
 - 按 `text_max_chars` 截断
 - 为训练集构建三分类标签
+
+### 字段内容示例
+
+单轮字符串形式：
+
+```csv
+id,prompt,response_a,response_b,winner_model_a,winner_model_b,winner_tie
+1,"What is LoRA?","LoRA is a parameter-efficient fine-tuning method.","LoRA is a new optimizer.",1,0,0
+```
+
+多轮对话数组形式：
+
+```csv
+id,prompt,response_a,response_b,winner_model_a,winner_model_b,winner_tie
+2,"[""Hello"",""Explain gradient checkpointing.""]","[""It reduces activation memory during training.""]","[""It only speeds up inference.""]",1,0,0
+```
+
+代码会将数组内容解析后按换行拼接，例如：
+
+```text
+["Hello", "Explain gradient checkpointing."]
+```
+
+会被处理成：
+
+```text
+Hello
+Explain gradient checkpointing.
+```
+
+### 训练输入与标签映射
+
+训练时，每条样本会被整理成这三个文本输入：
+
+- `prompt_text`
+- `response_a_text`
+- `response_b_text`
+
+标签映射关系固定为：
+
+- `winner_model_a -> 0`
+- `winner_model_b -> 1`
+- `winner_tie -> 2`
+
+也就是说，模型最终学习的是一个三分类问题，而不是生成式打分任务。
+
+### 预测输入与输出
+
+预测阶段输入来自 `test.csv`，只需要：
+
+- `id`
+- `prompt`
+- `response_a`
+- `response_b`
+
+模型输出为每个类别的概率，最终写入 `submission.csv`，列结构如下：
+
+- `id`
+- `winner_model_a`
+- `winner_model_b`
+- `winner_tie`
+
+输出示例：
+
+```csv
+id,winner_model_a,winner_model_b,winner_tie
+1,0.7321,0.2015,0.0664
+2,0.1250,0.7310,0.1440
+```
+
+三列概率之和约等于 `1.0`。
+
+## 模型架构
+
+当前模型不是生成式微调，而是一个标准的三分类判别模型。整体结构可以概括为：
+
+```text
+prompt ------> encoder ------
+                            |
+response_a --> encoder ---- |--> 特征拼接 --> MLP classifier --> 3-class logits
+                            |
+response_b --> encoder ------
+```
+
+### 1. 输入编码
+
+每条样本包含三段文本：
+
+- `prompt`
+- `response_a`
+- `response_b`
+
+这三段文本会分别经过同一个 `Qwen` embedding encoder 编码，共享权重，不是三套独立模型。
+
+encoder 输出 `last_hidden_state` 后，代码使用 `masked mean pooling` 得到三个句向量：
+
+- `prompt_emb`
+- `response_a_emb`
+- `response_b_emb`
+
+对应实现见：
+
+- [src/arena_ranker/modeling.py](./src/arena_ranker/modeling.py)
+- [src/arena_ranker/data.py](./src/arena_ranker/data.py)
+
+### 2. 特征构造
+
+当前分类器输入不是只拼接三个 embedding，而是构造了 6 组特征：
+
+- `prompt_emb`
+- `response_a_emb`
+- `response_b_emb`
+- `response_a_emb - response_b_emb`
+- `response_a_emb - prompt_emb`
+- `response_b_emb - prompt_emb`
+
+最终特征维度为：
+
+```text
+classifier_input = hidden_size * 6
+```
+
+这种设计的目的很直接：
+
+- 保留 `prompt`、`response_a`、`response_b` 的绝对表示
+- 显式引入 `A vs B`、`A vs prompt`、`B vs prompt` 的相对差异
+
+这比只拼接三段向量更适合当前偏好比较任务。
+
+### 3. 分类头
+
+拼接后的特征会进入一个两层 MLP：
+
+```text
+Linear(hidden_size * 6, hidden_size * 2)
+GELU
+Dropout
+Linear(hidden_size * 2, 3)
+```
+
+输出为 3 维 logits，对应：
+
+- `winner_model_a`
+- `winner_model_b`
+- `winner_tie`
+
+训练时使用 `CrossEntropyLoss`。
+
+### 4. LoRA 微调位置
+
+当前默认开启 LoRA，LoRA 注入在 encoder 注意力层的这些模块上：
+
+- `q_proj`
+- `k_proj`
+- `v_proj`
+- `o_proj`
+
+默认参数：
+
+- `r=16`
+- `alpha=32`
+- `dropout=0.05`
+
+也就是说，当前训练策略是：
+
+- encoder 主体参数大部分冻结为预训练权重
+- 只训练 LoRA adapter 和上层分类头
+
+这也是它能在 8GB 显存下运行的关键原因之一。
+
+### 5. 训练与推理流程
+
+训练阶段：
+
+1. 分别编码 `prompt`、`response_a`、`response_b`
+2. 做 mean pooling 得到三个向量
+3. 拼接 6 组特征
+4. 通过 MLP 得到三分类 logits
+5. 用 `CrossEntropyLoss` 计算损失
+
+推理阶段：
+
+1. 走同样的前向流程
+2. 对 logits 做 `softmax`
+3. 输出三列概率到 `submission.csv`
+
+### 6. 当前架构的特点
+
+优点：
+
+- 结构简单，容易训练和调试
+- 明确适配 Arena 偏好比较任务
+- 比全参数微调更节省显存
+
+限制：
+
+- 每个样本要对三段文本各跑一次 encoder，速度不会太快
+- 当前只用了 pooling + MLP，没有更复杂的交叉注意力比较模块
+- 架构偏向稳健基线，不是专门追求 SOTA 的复杂方案
 
 ## 训练
 
