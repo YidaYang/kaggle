@@ -37,6 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=None)
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--freeze-encoder", dest="freeze_encoder", action="store_true")
+    parser.add_argument("--disable-freeze-encoder", dest="freeze_encoder", action="store_false")
+    parser.add_argument("--classifier-only", action="store_true")
     parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true")
     parser.add_argument("--disable-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     parser.add_argument("--use-lora", dest="use_lora", action="store_true")
@@ -46,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=None)
     parser.add_argument("--lora-bias", type=str, default=None)
     parser.add_argument("--lora-target-modules", type=str, nargs="+", default=None)
-    parser.set_defaults(use_lora=None, gradient_checkpointing=None)
+    parser.set_defaults(use_lora=None, gradient_checkpointing=None, freeze_encoder=None)
     return parser.parse_args()
 
 
@@ -67,6 +70,12 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
         config.model.cache_dir = args.cache_dir
     if args.local_files_only:
         config.model.local_files_only = True
+    if args.freeze_encoder is not None:
+        config.model.freeze_encoder = args.freeze_encoder
+    if args.classifier_only:
+        config.model.freeze_encoder = True
+        config.model.use_lora = False
+        config.training.gradient_checkpointing = False
     if args.gradient_checkpointing is not None:
         config.training.gradient_checkpointing = args.gradient_checkpointing
     if args.use_lora is not None:
@@ -82,6 +91,26 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
     if args.lora_target_modules is not None:
         config.model.lora_target_modules = args.lora_target_modules
     return config
+
+
+def finalize_training_mode(config: AppConfig) -> AppConfig:
+    if config.model.freeze_encoder and config.model.use_lora:
+        LOGGER.info("检测到 freeze_encoder 与 LoRA 同时开启，已自动关闭 LoRA，仅训练分类头。")
+        config.model.use_lora = False
+
+    if config.model.freeze_encoder and config.training.gradient_checkpointing:
+        LOGGER.info("检测到 encoder 已冻结，已自动关闭 gradient checkpointing。")
+        config.training.gradient_checkpointing = False
+
+    return config
+
+
+def get_training_mode(config: AppConfig) -> str:
+    if config.model.freeze_encoder:
+        return "classifier-only"
+    if config.model.use_lora:
+        return "lora"
+    return "full-finetune"
 
 
 def set_seed(seed: int) -> None:
@@ -123,8 +152,10 @@ def describe_device(device: torch.device) -> str:
 
 
 def log_run_summary(config: AppConfig, device: torch.device, train_size: int, valid_size: int, total_steps: int) -> None:
+    training_mode = get_training_mode(config)
     LOGGER.info("训练启动")
     LOGGER.info("设备: %s", describe_device(device))
+    LOGGER.info("训练模式: %s", training_mode)
     LOGGER.info(
         "数据集: train=%s, valid=%s, batch_size=%s, grad_accum=%s, epochs=%s",
         train_size,
@@ -134,9 +165,10 @@ def log_run_summary(config: AppConfig, device: torch.device, train_size: int, va
         config.training.epochs,
     )
     LOGGER.info(
-        "模型: %s | max_length=%s | LoRA=%s | gradient_checkpointing=%s",
+        "模型: %s | max_length=%s | freeze_encoder=%s | LoRA=%s | gradient_checkpointing=%s",
         config.model.model_name,
         config.model.max_length,
+        "on" if config.model.freeze_encoder else "off",
         "on" if config.model.use_lora else "off",
         "on" if config.training.gradient_checkpointing else "off",
     )
@@ -148,6 +180,10 @@ def log_run_summary(config: AppConfig, device: torch.device, train_size: int, va
             config.model.lora_dropout,
             ",".join(config.model.lora_target_modules),
         )
+    if training_mode == "classifier-only":
+        LOGGER.info("当前仅训练分类头，encoder 作为冻结特征提取器使用。")
+    elif training_mode == "full-finetune":
+        LOGGER.info("当前进行全参数微调，encoder 和分类头都会参与训练。")
     LOGGER.info("优化步数: total=%s, warmup=%s", total_steps, int(total_steps * config.training.warmup_ratio))
     LOGGER.info("输出目录: %s", config.training.output_dir)
 
@@ -216,7 +252,7 @@ def save_artifacts(output_dir: Path, model: PreferenceClassifier, tokenizer, met
 def main() -> None:
     setup_logging()
     args = parse_args()
-    config = apply_overrides(load_config(args.config), args)
+    config = finalize_training_mode(apply_overrides(load_config(args.config), args))
     set_seed(config.training.seed)
 
     data_dir = Path(args.data_dir)

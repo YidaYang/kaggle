@@ -328,6 +328,28 @@ uv run arena-train
 - 启用 gradient checkpointing
 - 将产物保存到 `artifacts/default`
 
+### 三种训练模式
+
+当前项目明确支持三种训练模式：
+
+| 模式 | 命令 | encoder 参数 | LoRA | 适用场景 |
+| --- | --- | --- | --- | --- |
+| LoRA 微调 | `uv run arena-train` | 冻结主干，仅训练 adapter | 开启 | 默认推荐，兼顾效果与显存 |
+| 冻结 encoder，仅训练分类头 | `uv run arena-train --classifier-only` | 全冻结 | 关闭 | 把 Qwen 当固定特征提取器，训练成本最低 |
+| 全参数微调 | `uv run arena-train --disable-lora --disable-freeze-encoder` | 全量训练 | 关闭 | 显存充足，且希望整体继续适配任务 |
+
+推荐顺序：
+
+1. 先尝试 LoRA 微调
+2. 如果你只想快速验证分类头是否有效，用 `classifier-only`
+3. 只有在显存、训练时间都充足时再尝试全参数微调
+
+训练日志启动时也会明确打印当前模式，例如：
+
+```text
+21:10:00 | INFO | 训练模式: lora
+```
+
 ### 常用训练参数
 
 切换模型：
@@ -377,6 +399,44 @@ uv run arena-train --disable-lora
 ```
 
 不建议在 8GB 显存卡上直接关闭 LoRA。
+
+### 冻结 encoder，只训练分类头
+
+如果你想冻结 `Qwen/Qwen3-Embedding-0.6B`，只训练上层分类头，可以直接运行：
+
+```bash
+uv run arena-train --classifier-only
+```
+
+这个模式会自动做三件事：
+
+- 冻结 encoder 全部参数
+- 关闭 LoRA
+- 关闭 gradient checkpointing
+
+如果你只想显式冻结 encoder，也可以这样写：
+
+```bash
+uv run arena-train --freeze-encoder --disable-lora --disable-gradient-checkpointing
+```
+
+这适合你把 `Qwen/Qwen3-Embedding-0.6B` 作为固定特征提取器，仅训练分类层的场景。
+
+### 全参数微调
+
+如果你要让 encoder 和分类头一起训练，可以显式关闭 LoRA：
+
+```bash
+uv run arena-train --disable-lora --disable-freeze-encoder
+```
+
+这个模式下：
+
+- encoder 参数参与训练
+- 分类头参数参与训练
+- 不再使用 LoRA adapter
+
+这通常需要更多显存，也更容易训练更慢或不稳定。对 8GB 显存卡不作为默认推荐。
 
 ### 8GB 显存建议
 
