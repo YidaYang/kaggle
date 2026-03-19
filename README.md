@@ -36,6 +36,53 @@ prompt + response_a + response_b
 - 训练框架：HuggingFace Trainer
 - 评估指标：Log Loss + Accuracy（概率裁剪）
 
+## 在 Kaggle GPU Notebook 中运行
+
+本项目提供了开箱即用的 Kaggle Notebook：[`kaggle_notebook.ipynb`](./kaggle_notebook.ipynb)。
+
+### 快速上手
+
+1. **上传 Notebook**：将 `kaggle_notebook.ipynb` 上传到 Kaggle（New Notebook → File → Import Notebook）
+2. **添加竞赛数据**：右侧 Add Input → 搜索并添加竞赛数据集
+3. **开启 GPU**：Settings → Accelerator → **GPU T4 ×2** 或 **GPU P100**
+4. **开启联网**：Settings → Internet → **On**（首次运行需从 HuggingFace 下载模型）
+5. **修改竞赛 slug**：在 notebook 的「配置」单元格中修改 `COMPETITION_SLUG`
+6. **Run All**
+
+### Kaggle T4 GPU 推荐参数
+
+| 参数 | 8GB 显存 | T4 16GB |
+| --- | --- | --- |
+| `batch_size` | 1 | 2 |
+| `grad_accum_steps` | 16 | 8 |
+| `max_length` | 512 | 1024 |
+
+### 离线模式
+
+将模型提前上传到 Kaggle Models/Datasets，在 notebook 中修改：
+
+```python
+MODEL_NAME = "/kaggle/input/<model-dataset-slug>"
+```
+
+训练时加上 `sys.argv.append("--local-files-only")`。
+
+### 替代方案：将代码上传为 Kaggle Dataset
+
+```bash
+zip -r arena-ranker-code.zip src/ pyproject.toml README.md
+# 上传到 Kaggle Datasets 后，在 notebook 中：
+# !pip install /kaggle/input/arena-ranker-code/
+```
+
+### Notebook 维护
+
+Notebook 由 `scripts/generate_kaggle_notebook.py` 从源码自动生成。修改源码后运行：
+
+```bash
+python3 scripts/generate_kaggle_notebook.py
+```
+
 ## 安装
 
 ```bash
@@ -139,7 +186,9 @@ uv run arena-train --batch-size 1 --grad-accum-steps 16 --max-length 512
 
 ## Kaggle / Colab 使用
 
-在 Notebook 中可以直接导入使用：
+推荐直接使用 [`kaggle_notebook.ipynb`](./kaggle_notebook.ipynb)，详见上方「在 Kaggle GPU Notebook 中运行」章节。
+
+也可以在自己的 Notebook 中导入使用：
 
 ```python
 from arena_ranker.config import AppConfig
