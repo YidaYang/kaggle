@@ -49,13 +49,22 @@ prompt + response_a + response_b
 5. **修改竞赛 slug**：在 notebook 的「配置」单元格中修改 `COMPETITION_SLUG`
 6. **Run All**
 
-### Kaggle T4 GPU 推荐参数
+### Kaggle GPU 推荐参数
 
-| 参数 | 8GB 显存 | T4 16GB |
-| --- | --- | --- |
-| `batch_size` | 1 | 2 |
-| `grad_accum_steps` | 16 | 8 |
-| `max_length` | 512 | 1024 |
+| 参数 | 8GB 显存 | P100 16GB | T4 16GB |
+| --- | --- | --- | --- |
+| `batch_size` | 1 | 2 | 2 |
+| `grad_accum_steps` | 16 | 8 | 8 |
+| `max_length` | 512 | 1024 | 1024 |
+| `load_in_4bit` | True | True | True |
+| `fp16` | True | True | True |
+
+> **P100 注意事项**
+>
+> P100 (Pascal, compute capability 6.0) 没有 Tensor Core，FP16 矩阵运算比 T4 慢，
+> 但仍然支持 bitsandbytes 4-bit NF4 量化和 FP16 混合精度。
+> 对于 0.8B 参数模型，VRAM 参数与 T4 相同，主要差异体现在训练速度上。
+> **不支持 bf16**，请保持 `bf16=False`（已是默认值）。
 
 ### 离线模式
 
