@@ -47,6 +47,70 @@
     └── train.py
 ```
 
+## 在 Kaggle GPU Notebook 中运行
+
+本项目提供了一个开箱即用的 Kaggle Notebook：[`kaggle_notebook.ipynb`](./kaggle_notebook.ipynb)。
+
+### 快速上手
+
+1. **上传 Notebook**：将 `kaggle_notebook.ipynb` 上传到 Kaggle（New Notebook → File → Import Notebook）
+2. **添加竞赛数据**：右侧 Add Input → 搜索并添加竞赛数据集
+3. **开启 GPU**：Settings → Accelerator → 选择 **GPU T4 ×2** 或 **GPU P100**
+4. **开启联网**：Settings → Internet → **On**（首次运行需要从 HuggingFace 下载模型）
+5. **修改竞赛 slug**：在 notebook 的「配置」单元格中修改 `COMPETITION_SLUG`
+6. **Run All**
+
+### Kaggle T4 GPU 推荐参数
+
+Kaggle T4 有 16GB 显存，比本地 8GB 卡有更多余量：
+
+| 参数 | 本地 8GB | Kaggle T4 16GB |
+| --- | --- | --- |
+| `batch_size` | 1 | 2~4 |
+| `grad_accum_steps` | 8 | 4 |
+| `max_length` | 512 | 512 |
+| 有效 batch size | 8 | 8~16 |
+
+### 离线模式（不联网）
+
+如果 notebook 不能联网（例如最终提交时），需要提前将模型上传到 Kaggle：
+
+1. 在本地下载 `Qwen/Qwen3-Embedding-0.6B` 的完整文件
+2. 前往 [kaggle.com/models](https://kaggle.com/models) → New Model → 上传
+3. 在 notebook 中把 `MODEL_NAME` 改为 Kaggle 模型路径，例如 `/kaggle/input/<model-slug>/`
+4. 训练时会自动使用本地模型，不需要联网
+
+### 替代方案：将代码上传为 Kaggle Dataset
+
+如果不想在 notebook 里内联代码，可以把本仓库上传为 Kaggle Dataset：
+
+```bash
+zip -r arena-ranker-code.zip src/ pyproject.toml README.md
+```
+
+上传后在 notebook 中安装：
+
+```python
+!pip install /kaggle/input/arena-ranker-code/
+```
+
+然后直接使用命令行工具：
+
+```bash
+!arena-train --data-dir /kaggle/input/<competition-slug>/ --output-dir /kaggle/working/artifacts/default
+!arena-predict --checkpoint-dir /kaggle/working/artifacts/default --data-dir /kaggle/input/<competition-slug>/ --output-path /kaggle/working/submission.csv
+```
+
+### Notebook 维护
+
+Notebook 由 `scripts/generate_kaggle_notebook.py` 从源码自动生成。当你修改了 `src/arena_ranker/` 下的代码后，重新运行：
+
+```bash
+python3 scripts/generate_kaggle_notebook.py
+```
+
+即可同步更新 notebook 中的内嵌代码。
+
 ## 安装
 
 ```bash
