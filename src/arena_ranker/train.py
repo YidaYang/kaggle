@@ -187,6 +187,12 @@ def get_world_size() -> int:
     return int(raw) if raw is not None else 1
 
 
+def get_visible_gpu_count() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
 def get_runtime_device() -> torch.device:
     if not torch.cuda.is_available():
         return torch.device("cpu")
@@ -195,6 +201,20 @@ def get_runtime_device() -> torch.device:
         torch.cuda.set_device(local_rank)
         return torch.device("cuda", local_rank)
     return torch.device("cuda")
+
+
+def validate_parallelism_config(config: AppConfig) -> None:
+    """提前拦截已知不兼容的并行配置，避免 Trainer 落到 DataParallel。"""
+    visible_gpu_count = get_visible_gpu_count()
+    world_size = get_world_size()
+    if config.model.load_in_4bit and world_size == 1 and visible_gpu_count > 1:
+        raise RuntimeError(
+            "检测到单进程训练，但当前可见 GPU 数量大于 1。"
+            "HuggingFace Trainer 会回退到 torch.nn.DataParallel，"
+            "而 bitsandbytes 4-bit / QLoRA 与 DataParallel 不兼容。"
+            "请改用 torch.distributed.run --nproc_per_node=<GPU数> 启动多进程训练，"
+            "或在单进程训练前设置 CUDA_VISIBLE_DEVICES=0 只暴露一张 GPU。"
+        )
 
 
 # ============================================================
@@ -361,6 +381,7 @@ def main() -> None:
     setup_logging()
     args = parse_args()
     config = apply_overrides(load_config(args.config), args)
+    validate_parallelism_config(config)
     device = get_runtime_device()
     set_seed(config.training.seed)
 

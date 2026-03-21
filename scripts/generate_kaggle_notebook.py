@@ -160,7 +160,8 @@ def build_cells() -> list[dict]:
         "⚠️ **请根据你的实际竞赛修改 `COMPETITION_SLUG`。**\n"
         "\n"
         "双 T4 会自动走分布式双卡训练；P100 保持单卡训练。\n"
-        "T4 不支持 bf16，因此默认保持 `BF16 = False`。"
+        "T4 不支持 bf16，因此默认保持 `BF16 = False`。\n"
+        "若 notebook 当前可见两张 GPU 但你强制改成单进程，会自动只暴露 `cuda:0`，避免 Trainer 误退回 DataParallel。"
     ))
     cells.append(make_code(
         "import torch\n"
@@ -183,7 +184,8 @@ def build_cells() -> list[dict]:
         "LOCAL_FILES_ONLY = False\n"
         "# ============================================================\n"
         "\n"
-        "NUM_PROCESSES = torch.cuda.device_count() if torch.cuda.is_available() else 1\n"
+        "VISIBLE_GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0\n"
+        "NUM_PROCESSES = VISIBLE_GPU_COUNT if VISIBLE_GPU_COUNT > 0 else 1\n"
         'DATA_DIR    = f"/kaggle/input/{COMPETITION_SLUG}"\n'
         'OUTPUT_DIR  = "/kaggle/working/artifacts/default"\n'
         "\n"
@@ -191,7 +193,8 @@ def build_cells() -> list[dict]:
         'vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0\n'
         'effective_batch = BATCH_SIZE * GRAD_ACCUM_STEPS * max(NUM_PROCESSES, 1)\n'
         'print(f"设备: {device_name} ({vram_gb:.1f} GB)")\n'
-        'print(f"GPU 数量: {NUM_PROCESSES}")\n'
+        'print(f"可见 GPU 数量: {VISIBLE_GPU_COUNT}")\n'
+        'print(f"训练进程数: {NUM_PROCESSES}")\n'
         'print(f"有效 batch size: {effective_batch}")\n'
         'print(f"数据目录: {DATA_DIR}")\n'
         'print(f"输出目录: {OUTPUT_DIR}")\n'
@@ -208,9 +211,42 @@ def build_cells() -> list[dict]:
         'print("✅ 数据验证通过")\n'
     ))
 
+    # ── Section: Prepare model ──
+    cells.append(make_markdown(
+        "## 4. 预下载模型（推荐）\n"
+        "\n"
+        "为了避免双卡训练时两个进程同时从 HuggingFace 远程拉取同一个模型，\n"
+        "这里会先把远程模型下载到 `/kaggle/working/hf_models/`，随后训练阶段改为只读本地目录。\n"
+        "\n"
+        "> 同时会设置 `HF_HUB_DISABLE_XET=1`，优先使用标准 HTTP 下载链路。"
+    ))
+    cells.append(make_code(
+        "import os\n"
+        "from pathlib import Path\n"
+        "\n"
+        'os.environ.setdefault("HF_HOME", "/kaggle/working/hf_cache")\n'
+        'os.environ["HF_HUB_DISABLE_XET"] = "1"\n'
+        "\n"
+        "MODEL_RUNTIME_PATH = MODEL_NAME\n"
+        "if \"/\" in MODEL_NAME and not MODEL_NAME.startswith(\"/\") and not LOCAL_FILES_ONLY:\n"
+        "    from huggingface_hub import snapshot_download\n"
+        "\n"
+        '    local_model_dir = Path("/kaggle/working/hf_models") / MODEL_NAME.replace("/", "--")\n'
+        "    local_model_dir.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    MODEL_RUNTIME_PATH = snapshot_download(\n"
+        "        repo_id=MODEL_NAME,\n"
+        "        local_dir=str(local_model_dir),\n"
+        "        resume_download=True,\n"
+        "    )\n"
+        "    LOCAL_FILES_ONLY = True\n"
+        "\n"
+        'print(f\"训练时模型路径: {MODEL_RUNTIME_PATH}\")\n'
+        'print(f\"LOCAL_FILES_ONLY: {LOCAL_FILES_ONLY}\")\n'
+    ))
+
     # ── Section: Training ──
     cells.append(make_markdown(
-        "## 4. 训练\n"
+        "## 5. 训练\n"
         "\n"
         "使用 QLoRA 微调 `Qwen3-0.6B`，通过 HuggingFace Trainer 训练。\n"
         "\n"
@@ -248,7 +284,7 @@ def build_cells() -> list[dict]:
         "train_command.extend([\n"
         '    "--data-dir", DATA_DIR,\n'
         '    "--output-dir", OUTPUT_DIR,\n'
-        '    "--model-name", MODEL_NAME,\n'
+        '    "--model-name", MODEL_RUNTIME_PATH,\n'
         '    "--epochs", str(EPOCHS),\n'
         '    "--batch-size", str(BATCH_SIZE),\n'
         '    "--grad-accum-steps", str(GRAD_ACCUM_STEPS),\n'
@@ -277,13 +313,18 @@ def build_cells() -> list[dict]:
         "\n"
         "env = os.environ.copy()\n"
         'env["PYTHONPATH"] = "/kaggle/working"\n'
+        'env["HF_HUB_DISABLE_XET"] = "1"\n'
+        'env.setdefault("HF_HOME", "/kaggle/working/hf_cache")\n'
+        "if NUM_PROCESSES == 1 and VISIBLE_GPU_COUNT > 1:\n"
+        '    env["CUDA_VISIBLE_DEVICES"] = "0"\n'
+        '    print("单进程训练: 已设置 CUDA_VISIBLE_DEVICES=0，避免 Trainer 使用 DataParallel")\n'
         'print("训练命令:", " ".join(shlex.quote(part) for part in train_command))\n'
         "subprocess.run(train_command, env=env, check=True)\n"
     ))
 
     # ── Section: Inference ──
     cells.append(make_markdown(
-        "## 5. 推理与生成提交文件\n"
+        "## 6. 推理与生成提交文件\n"
         "\n"
         "加载训练好的 QLoRA adapter + 分类头，对 `test.csv` 推理生成 `submission.csv`。"
     ))
@@ -305,7 +346,7 @@ def build_cells() -> list[dict]:
     ))
 
     # ── Section: Review submission ──
-    cells.append(make_markdown("## 6. 检查提交文件"))
+    cells.append(make_markdown("## 7. 检查提交文件"))
     cells.append(make_code(
         "import pandas as pd\n"
         "\n"

@@ -65,6 +65,12 @@ prompt + response_a + response_b
 > `kaggle_notebook.ipynb` 会在检测到两张 GPU 时自动使用
 > `torch.distributed.run --nproc_per_node=2` 启动双卡训练。
 > 若想保持与单卡默认配置接近的有效 batch，推荐 `batch_size=2, grad_accum_steps=4`。
+> notebook 还会先把远程模型预下载到 `/kaggle/working`，再切换到本地只读加载，
+> 以减少双进程并发拉取模型导致的卡顿。
+>
+> 如果你在双 T4 环境里手动把进程数改回 1，请同时只暴露一张 GPU
+> （如 `CUDA_VISIBLE_DEVICES=0`），否则 `Trainer` 会退回 `DataParallel`，
+> 而 bitsandbytes 4-bit / QLoRA 与它不兼容。
 >
 > **P100 注意事项**
 >
