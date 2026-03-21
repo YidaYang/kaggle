@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import json
+from itertools import zip_longest
 from typing import Any
 
 import numpy as np
@@ -25,6 +26,7 @@ from arena_ranker.config import (
     LABEL_TO_ID,
     SYSTEM_PROMPT,
     USER_TEMPLATE,
+    VERDICT_SUFFIX,
     DataConfig,
 )
 
@@ -60,11 +62,45 @@ def _parse_conversation_field(value: Any) -> list[str]:
     return [text]
 
 
-def _normalize_text(value: Any, max_chars: int) -> str:
-    """将原始字段转为纯文本，按 max_chars 截断。"""
+def _normalize_conversation_turns(value: Any, max_chars: int) -> list[str]:
+    """将原始字段转为按轮次保序的字符串列表，并在总字符预算内截断。"""
     chunks = _parse_conversation_field(value)
-    text = "\n".join(chunk.strip() for chunk in chunks if str(chunk).strip())
-    return text[:max_chars]
+    normalized = [chunk.strip() for chunk in chunks if str(chunk).strip()]
+    if not normalized:
+        return []
+
+    kept: list[str] = []
+    used_chars = 0
+    for chunk in normalized:
+        remaining = max_chars - used_chars
+        if remaining <= 0:
+            break
+        truncated = chunk[:remaining]
+        if truncated:
+            kept.append(truncated)
+            used_chars += len(truncated)
+    return kept
+
+
+def _build_conversation_text(
+    prompt_turns: list[str],
+    response_a_turns: list[str],
+    response_b_turns: list[str],
+) -> str:
+    """按轮次交错拼接 prompt / A / B，保留多轮对话结构。"""
+    head = "<|The Start of Conversation between a User and two Assistants|>"
+    tail = "<|The End of Conversation between a User and two Assistants|>\n"
+    parts = []
+    for prompt, response_a, response_b in zip_longest(
+        prompt_turns,
+        response_a_turns,
+        response_b_turns,
+        fillvalue="null",
+    ):
+        parts.append(
+            f"\n### User:\n{prompt}\n\n### Assistant A:\n{response_a}\n\n### Assistant B:\n{response_b}\n"
+        )
+    return head + "".join(parts) + tail
 
 
 def _build_label(row: pd.Series) -> int:
@@ -88,13 +124,19 @@ def load_and_preprocess(
     加载 CSV 并预处理文本字段。
 
     Returns:
-        DataFrame，包含 id / prompt_clean / response_a_clean / response_b_clean
+        DataFrame，包含 id / prompt_turns / response_a_turns / response_b_turns
         以及 (仅训练集) labels 列。
     """
     df = pd.read_csv(csv_path)
-    df["prompt_clean"] = df["prompt"].map(lambda x: _normalize_text(x, max_chars))
-    df["response_a_clean"] = df["response_a"].map(lambda x: _normalize_text(x, max_chars))
-    df["response_b_clean"] = df["response_b"].map(lambda x: _normalize_text(x, max_chars))
+    df["prompt_turns"] = df["prompt"].map(
+        lambda x: _normalize_conversation_turns(x, max_chars)
+    )
+    df["response_a_turns"] = df["response_a"].map(
+        lambda x: _normalize_conversation_turns(x, max_chars)
+    )
+    df["response_b_turns"] = df["response_b"].map(
+        lambda x: _normalize_conversation_turns(x, max_chars)
+    )
     if is_train:
         df["labels"] = df.apply(_build_label, axis=1)
     return df
@@ -118,21 +160,17 @@ def split_train_valid(
 #  Chat Template Tokenization
 # ============================================================
 
-def _build_chat_messages(prompt: str, response_a: str, response_b: str) -> list[dict]:
+def _build_chat_messages(conversation: str) -> list[dict]:
     """
     构建对话消息列表，用于 apply_chat_template。
       - system: 评委角色指令
-      - user:   prompt + response_a + response_b 的完整内容
+      - user:   保留轮次结构的完整对话
     """
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": USER_TEMPLATE.format(
-                prompt=prompt,
-                response_a=response_a,
-                response_b=response_b,
-            ),
+            "content": USER_TEMPLATE.format(conversation=conversation),
         },
     ]
 
@@ -145,16 +183,18 @@ def _tokenize_single(example: dict, tokenizer, max_length: int) -> dict:
       1. 用 apply_chat_template 将对话格式化为文本
       2. 用 tokenizer 编码并截断到 max_length
     """
-    messages = _build_chat_messages(
-        example["prompt_clean"],
-        example["response_a_clean"],
-        example["response_b_clean"],
+    conversation = _build_conversation_text(
+        example["prompt_turns"],
+        example["response_a_turns"],
+        example["response_b_turns"],
     )
+    messages = _build_chat_messages(conversation)
     # 先得到格式化文本，再单独 tokenize 以精确控制截断
-    # add_generation_prompt=False: 分类任务不需要 assistant 角色前缀
     text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False,
-    )
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    ) + VERDICT_SUFFIX
     encoded = tokenizer(
         text,
         truncation=True,
@@ -169,6 +209,8 @@ def build_dataset(
     tokenizer,
     max_length: int = 1024,
     is_train: bool = True,
+    include_swap: bool = False,
+    swap_pairs: bool = False,
 ) -> Dataset:
     """
     从 DataFrame 构建 tokenized HuggingFace Dataset。
@@ -176,10 +218,25 @@ def build_dataset(
     输出列（训练）: input_ids, attention_mask, labels
     输出列（测试）: input_ids, attention_mask
     """
-    cols = ["id", "prompt_clean", "response_a_clean", "response_b_clean"]
+    cols = ["id", "prompt_turns", "response_a_turns", "response_b_turns"]
     if is_train:
         cols.append("labels")
-    dataset = Dataset.from_pandas(df[cols], preserve_index=False)
+    base_df = df[cols].copy()
+
+    if swap_pairs or include_swap:
+        swap_df = base_df.copy()
+        swap_df["response_a_turns"] = base_df["response_b_turns"]
+        swap_df["response_b_turns"] = base_df["response_a_turns"]
+        if is_train:
+            swap_df["labels"] = swap_df["labels"].map(
+                lambda x: 1 if x == 0 else 0 if x == 1 else x
+            )
+        if swap_pairs:
+            base_df = swap_df
+        elif include_swap:
+            base_df = pd.concat([base_df, swap_df], ignore_index=True)
+
+    dataset = Dataset.from_pandas(base_df, preserve_index=False)
 
     dataset = dataset.map(
         lambda x: _tokenize_single(x, tokenizer, max_length),
@@ -187,7 +244,7 @@ def build_dataset(
     )
 
     # 移除文本列，只保留模型需要的数值列
-    remove_cols = ["prompt_clean", "response_a_clean", "response_b_clean", "id"]
+    remove_cols = ["prompt_turns", "response_a_turns", "response_b_turns", "id"]
     dataset = dataset.remove_columns(
         [c for c in remove_cols if c in dataset.column_names]
     )

@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
                         help="梯度累积步数")
     parser.add_argument("--learning-rate", type=float, default=None,
                         help="学习率")
+    parser.add_argument("--warmup-ratio", type=float, default=None,
+                        help="warmup 占总训练步数的比例")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="warmup 绝对步数；设置后覆盖 warmup_ratio")
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--disable-lora", dest="use_lora", action="store_false")
@@ -87,6 +91,10 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
         config.training.gradient_accumulation_steps = args.grad_accum_steps
     if args.learning_rate is not None:
         config.training.learning_rate = args.learning_rate
+    if args.warmup_ratio is not None:
+        config.training.warmup_ratio = args.warmup_ratio
+    if args.warmup_steps is not None:
+        config.training.warmup_steps = args.warmup_steps
     if args.cache_dir is not None:
         config.model.cache_dir = args.cache_dir
     if args.local_files_only:
@@ -169,6 +177,7 @@ def build_training_args(config: AppConfig) -> TrainingArguments:
         per_device_eval_batch_size=tc.per_device_eval_batch_size,
         gradient_accumulation_steps=tc.gradient_accumulation_steps,
         num_train_epochs=tc.num_train_epochs,
+        warmup_ratio=tc.warmup_ratio,
         warmup_steps=tc.warmup_steps,
         lr_scheduler_type=tc.lr_scheduler_type,
         optim=optim,
@@ -225,12 +234,12 @@ def log_run_summary(
         train_size, valid_size,
     )
     LOGGER.info(
-        "训练参数: lr=%.1e, epochs=%s, batch=%s, grad_accum=%s, scheduler=%s, warmup=%.2f",
+        "训练参数: lr=%.1e, epochs=%s, batch=%s, grad_accum=%s, scheduler=%s, warmup=%s",
         tc.learning_rate, tc.num_train_epochs,
         tc.per_device_train_batch_size,
         tc.gradient_accumulation_steps,
         tc.lr_scheduler_type,
-        tc.warmup_steps,
+        f"{tc.warmup_steps} steps" if tc.warmup_steps > 0 else f"{tc.warmup_ratio:.2%}",
     )
     LOGGER.info("输出目录: %s", tc.output_dir)
     LOGGER.info("=" * 60)
@@ -302,10 +311,17 @@ def main() -> None:
     # ---- 3. Tokenize 数据集 ----
     LOGGER.info("Tokenizing 数据集 (max_length=%s)...", config.model.max_length)
     train_dataset = build_dataset(
-        train_split, tokenizer, config.model.max_length, is_train=True,
+        train_split,
+        tokenizer,
+        config.model.max_length,
+        is_train=True,
+        include_swap=config.data.include_swap_train,
     )
     valid_dataset = build_dataset(
-        valid_split, tokenizer, config.model.max_length, is_train=True,
+        valid_split,
+        tokenizer,
+        config.model.max_length,
+        is_train=True,
     )
     LOGGER.info(
         "Tokenization 完成: train=%s, valid=%s",

@@ -97,6 +97,18 @@ def normalize_probabilities(
     return probs
 
 
+def run_inference(loader: DataLoader, model, device: torch.device) -> np.ndarray:
+    """对一个 DataLoader 执行完整推理并返回概率矩阵。"""
+    all_probs = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="predict"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            probs = normalize_probabilities(outputs.logits)
+            all_probs.append(probs)
+    return np.concatenate(all_probs, axis=0)
+
+
 # ============================================================
 #  加载推理模型
 # ============================================================
@@ -226,15 +238,26 @@ def main() -> None:
         collate_fn=data_collator,
     )
 
-    all_probs = []
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="predict"):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            probs = normalize_probabilities(outputs.logits)
-            all_probs.append(probs)
+    all_probs = run_inference(loader, model, device)
 
-    all_probs = np.concatenate(all_probs, axis=0)
+    if config.data.include_swap_tta:
+        swap_dataset = build_dataset(
+            test_df,
+            tokenizer,
+            config.model.max_length,
+            is_train=False,
+            swap_pairs=True,
+        )
+        swap_loader = DataLoader(
+            swap_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=data_collator,
+        )
+        LOGGER.info("启用 swap TTA，再运行一次对称预测")
+        swap_probs = run_inference(swap_loader, model, device)
+        swap_probs = swap_probs[:, [1, 0, 2]]
+        all_probs = (all_probs + swap_probs) / 2.0
 
     # ---- 6. 写出 submission.csv ----
     rows = []

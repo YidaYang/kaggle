@@ -84,7 +84,7 @@ def build_cells() -> list[dict]:
     cells.append(make_markdown(
         "# Arena Ranker — Kaggle GPU 训练与推理\n"
         "\n"
-        "本 notebook 在 Kaggle 提供的 **GPU 环境（T4 16GB / P100 16GB）** 中完成：\n"
+        "本 notebook 在 Kaggle 1提供的 **GPU 环境（T4 16GB / P100 16GB）** 中完成：\n"
         "\n"
         "1. 安装依赖\n"
         "2. 设置项目源码\n"

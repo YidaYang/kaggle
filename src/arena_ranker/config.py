@@ -28,14 +28,20 @@ NUM_LABELS = 3
 # ============================================================
 #  对话模板常量
 # ============================================================
-SYSTEM_PROMPT = "你是一个公正的评委，请全面评估两个回答，并预测人类最偏好的选项。"
+SYSTEM_PROMPT = """Please act as an impartial judge and evaluate the quality of the responses provided by two
+AI assistants to the user question displayed below. You should choose the assistant that
+follows the user’s instructions and answers the user’s question better. Your evaluation
+should consider factors such as the helpfulness, relevance, accuracy, depth, creativity,
+and level of detail of their responses. Begin your evaluation by comparing the two
+responses and provide a short explanation. Avoid any position biases and ensure that the
+order in which the responses were presented does not influence your decision. Do not allow
+the length of the responses to influence your evaluation. Do not favor certain names of
+the assistants. Be as objective as possible. After providing your explanation, output your
+final verdict by strictly following this format: "[[A]]" if assistant A is better, "[[B]]"
+if assistant B is better, and "[[C]]" for a tie."""
 
-USER_TEMPLATE = (
-    "以下是用户的提问：\n{prompt}\n\n"
-    "回答A：\n{response_a}\n\n"
-    "回答B：\n{response_b}\n\n"
-    "综合评估，你认为哪个回答更好？"
-)
+USER_TEMPLATE = "{conversation}"
+VERDICT_SUFFIX = "verdict is: [["
 
 
 # ============================================================
@@ -48,6 +54,8 @@ class DataConfig:
     text_max_chars: int = 6000
     validation_size: float = 0.1
     random_state: int = 42
+    include_swap_train: bool = True
+    include_swap_tta: bool = True
 
 
 # ============================================================
@@ -94,7 +102,8 @@ class TrainingConfig:
     per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 8
     num_train_epochs: int = 3
-    warmup_steps: float = 0.1
+    warmup_ratio: float = 0.1
+    warmup_steps: int = 0
     lr_scheduler_type: str = "cosine"
     optim: str = "paged_adamw_32bit"
     fp16: bool = True
@@ -138,8 +147,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if path is None:
         return AppConfig()
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    training_raw = raw.get("training", {})
+
+    # 兼容旧配置: 曾误把 0.1 这类比例写进 warmup_steps。
+    legacy_warmup = training_raw.get("warmup_steps")
+    if "warmup_ratio" not in training_raw and isinstance(legacy_warmup, float):
+        if 0.0 <= legacy_warmup <= 1.0:
+            training_raw["warmup_ratio"] = legacy_warmup
+            training_raw["warmup_steps"] = 0
+
     return AppConfig(
         data=DataConfig(**raw.get("data", {})),
         model=ModelConfig(**raw.get("model", {})),
-        training=TrainingConfig(**raw.get("training", {})),
+        training=TrainingConfig(**training_raw),
     )
