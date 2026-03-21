@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -47,6 +48,18 @@ def _describe_model_source(model_name: str) -> str:
             "首次运行需联网下载；离线环境请预下载到本地再修改 model_name。"
         )
     return f"`{model_name}` 既不是本地目录，也不是标准 HuggingFace 仓库 ID。"
+
+
+def _get_local_rank() -> int | None:
+    """读取 torch.distributed 注入的 LOCAL_RANK。"""
+    raw = os.environ.get("LOCAL_RANK")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.warning("忽略非法 LOCAL_RANK=%r", raw)
+        return None
 
 
 # ============================================================
@@ -150,9 +163,9 @@ def load_model(config: ModelConfig, tokenizer=None):
         PEFT 包装后的模型（若 use_lora=True），否则原始模型。
     """
     bnb_config = _build_bnb_config(config)
+    local_rank = _get_local_rank()
 
-    # Qwen3.5 是 VLM 模型，config 有嵌套的 text_config。
-    # 需要确保 num_labels 被正确传播到 text_config。
+    # Qwen 系列部分配置会带嵌套 text_config，需要确保 num_labels 正确传播。
     try:
         model_config = AutoConfig.from_pretrained(
             config.model_name,
@@ -167,22 +180,30 @@ def load_model(config: ModelConfig, tokenizer=None):
             f"{_describe_model_source(config.model_name)}"
         ) from exc
 
-    # Qwen3.5 VLM 的 num_labels 可能没有传播到 text_config
+    # 某些 Qwen 配置不会自动把 num_labels 传播到 text_config
     if hasattr(model_config, "text_config"):
         model_config.text_config.num_labels = NUM_LABELS
         LOGGER.info("已手动将 num_labels=%s 传播到 text_config", NUM_LABELS)
 
+    if local_rank is not None and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        LOGGER.info("分布式训练: 当前进程绑定到 cuda:%s", local_rank)
+
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    model_kwargs = dict(
+        pretrained_model_name_or_path=config.model_name,
+        config=model_config,
+        quantization_config=bnb_config,
+        trust_remote_code=True,
+        cache_dir=config.cache_dir,
+        local_files_only=config.local_files_only,
+        torch_dtype=dtype,
+    )
+    # QLoRA + DDP 需要确保每个 rank 只把量化模型加载到本地 GPU。
+    if bnb_config is not None and local_rank is not None:
+        model_kwargs["device_map"] = {"": local_rank}
     try:
-        model = AutoModelForSequenceClassification.from_pretrained(
-            config.model_name,
-            config=model_config,
-            quantization_config=bnb_config,
-            trust_remote_code=True,
-            cache_dir=config.cache_dir,
-            local_files_only=config.local_files_only,
-            torch_dtype=dtype,
-        )
+        model = AutoModelForSequenceClassification.from_pretrained(**model_kwargs)
     except OSError as exc:
         raise RuntimeError(
             f"加载模型失败: {exc}\n"

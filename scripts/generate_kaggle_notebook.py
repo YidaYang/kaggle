@@ -84,11 +84,11 @@ def build_cells() -> list[dict]:
     cells.append(make_markdown(
         "# Arena Ranker — Kaggle GPU 训练与推理\n"
         "\n"
-        "本 notebook 在 Kaggle 1提供的 **GPU 环境（T4 16GB / P100 16GB）** 中完成：\n"
+        "本 notebook 在 Kaggle 提供的 **GPU 环境（T4 x2 / P100 x1）** 中完成：\n"
         "\n"
         "1. 安装依赖\n"
         "2. 设置项目源码\n"
-        "3. 使用 **QLoRA** 微调 `Qwen/Qwen3.5-0.8B` 偏好分类模型\n"
+        "3. 使用 **QLoRA** 微调 `Qwen/Qwen3-0.6B` 偏好分类模型\n"
         "4. 推理并生成 `submission.csv`\n"
         "\n"
         "### 核心架构\n"
@@ -98,7 +98,7 @@ def build_cells() -> list[dict]:
         "        ↓\n"
         "  apply_chat_template (system + user)\n"
         "        ↓\n"
-        "  Qwen3.5-0.8B (4-bit NF4 量化)\n"
+        "  Qwen3-0.6B (4-bit NF4 量化)\n"
         "        ↓\n"
         "  AutoModelForSequenceClassification\n"
         "        ↓\n"
@@ -159,8 +159,8 @@ def build_cells() -> list[dict]:
         "\n"
         "⚠️ **请根据你的实际竞赛修改 `COMPETITION_SLUG`。**\n"
         "\n"
-        "T4 和 P100 都是 16GB 显存，对 0.8B 模型 VRAM 参数相同；\n"
-        "P100 没有 Tensor Core，训练速度会慢一些，但不需要改参数。"
+        "双 T4 会自动走分布式双卡训练；P100 保持单卡训练。\n"
+        "T4 不支持 bf16，因此默认保持 `BF16 = False`。"
     ))
     cells.append(make_code(
         "import torch\n"
@@ -169,22 +169,30 @@ def build_cells() -> list[dict]:
         "# 🔧 根据你的情况修改以下参数\n"
         "# ============================================================\n"
         'COMPETITION_SLUG = "llm-classification-finetuning"   # ← 改成你的竞赛 slug\n'
-        'MODEL_NAME       = "Qwen/Qwen3.5-0.8B"              # 基座模型\n'
+        'MODEL_NAME       = "Qwen/Qwen3-0.6B"                # 基座模型\n'
         "EPOCHS           = 3\n"
-        "BATCH_SIZE       = 2        # T4/P100 16GB 推荐 2\n"
-        "GRAD_ACCUM_STEPS = 8\n"
+        "BATCH_SIZE       = 2        # per-device batch size\n"
+        "GRAD_ACCUM_STEPS = 4        # T4 x2 时推荐 4；P100 单卡可改回 8\n"
         "MAX_LENGTH       = 1024     # T4/P100 16GB 推荐 1024\n"
         "LEARNING_RATE    = 2e-4\n"
         "USE_LORA         = True\n"
         "LOAD_IN_4BIT     = True     # QLoRA 4-bit 量化\n"
+        "FP16             = True     # T4 Tensor Cores 建议开启\n"
+        "BF16             = False    # T4 不支持 bf16，请保持关闭\n"
+        "DDP_FIND_UNUSED_PARAMETERS = False\n"
+        "LOCAL_FILES_ONLY = False\n"
         "# ============================================================\n"
         "\n"
+        "NUM_PROCESSES = torch.cuda.device_count() if torch.cuda.is_available() else 1\n"
         'DATA_DIR    = f"/kaggle/input/{COMPETITION_SLUG}"\n'
         'OUTPUT_DIR  = "/kaggle/working/artifacts/default"\n'
         "\n"
         'device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"\n'
         'vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0\n'
+        'effective_batch = BATCH_SIZE * GRAD_ACCUM_STEPS * max(NUM_PROCESSES, 1)\n'
         'print(f"设备: {device_name} ({vram_gb:.1f} GB)")\n'
+        'print(f"GPU 数量: {NUM_PROCESSES}")\n'
+        'print(f"有效 batch size: {effective_batch}")\n'
         'print(f"数据目录: {DATA_DIR}")\n'
         'print(f"输出目录: {OUTPUT_DIR}")\n'
     ))
@@ -204,43 +212,73 @@ def build_cells() -> list[dict]:
     cells.append(make_markdown(
         "## 4. 训练\n"
         "\n"
-        "使用 QLoRA 微调 `Qwen3.5-0.8B`，通过 HuggingFace Trainer 训练。\n"
+        "使用 QLoRA 微调 `Qwen3-0.6B`，通过 HuggingFace Trainer 训练。\n"
         "\n"
-        "| 参数 | T4 / P100 16GB | 8GB 显存 | 说明 |\n"
-        "| --- | --- | --- | --- |\n"
-        "| `BATCH_SIZE` | 2 | 1 | per device |\n"
-        "| `GRAD_ACCUM_STEPS` | 8 | 16 | 有效 batch = BATCH_SIZE × steps |\n"
-        "| `MAX_LENGTH` | 1024 | 512 | 输入序列最大 token 数 |\n"
-        "| `EPOCHS` | 3 | 3 | 训练轮数 |\n"
-        "| `LEARNING_RATE` | 2e-4 | 2e-4 | AdamW 学习率 |\n"
-        "| `LOAD_IN_4BIT` | True | True | 4-bit NF4 量化 (QLoRA) |\n"
+        "| 参数 | T4 x2 | P100 x1 | 8GB 显存 | 说明 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| `BATCH_SIZE` | 2 | 2 | 1 | per-device |\n"
+        "| `GRAD_ACCUM_STEPS` | 4 | 8 | 16 | 有效 batch = `batch × grad_accum × GPU数` |\n"
+        "| `MAX_LENGTH` | 1024 | 1024 | 512 | 输入序列最大 token 数 |\n"
+        "| `EPOCHS` | 3 | 3 | 3 | 训练轮数 |\n"
+        "| `LEARNING_RATE` | 2e-4 | 2e-4 | 2e-4 | AdamW 学习率 |\n"
+        "| `LOAD_IN_4BIT` | True | True | True | 4-bit NF4 量化 (QLoRA) |\n"
+        "| `FP16` | True | True | True | 启用混合精度 |\n"
+        "| `BF16` | False | False | False | T4 / P100 都不要开启 |\n"
         "\n"
-        "> **P100 注意事项**: P100 (Pascal) 没有 Tensor Core，FP16 矩阵运算比 T4 慢，\n"
-        "> 但 bitsandbytes 4-bit 量化和 FP16 混合精度均可正常使用。\n"
-        "> VRAM 参数与 T4 相同，主要差异体现在训练速度上。**不支持 bf16**（已是默认关闭）。"
+        "> **双卡训练说明**: notebook 会自动检测 GPU 数量。\n"
+        "> 当检测到 `T4 x2` 时，会使用 `torch.distributed.run --nproc_per_node=2` 启动双卡训练。\n"
+        "> 若想保持与单卡默认配置接近的有效 batch，推荐 `BATCH_SIZE=2, GRAD_ACCUM_STEPS=4`。"
     ))
     cells.append(make_code(
+        "import os\n"
+        "import shlex\n"
+        "import subprocess\n"
         "import sys\n"
         "\n"
-        "sys.argv = [\n"
-        '    "arena-train",\n'
-        '    "--data-dir",        DATA_DIR,\n'
-        '    "--output-dir",      OUTPUT_DIR,\n'
-        '    "--model-name",      MODEL_NAME,\n'
-        '    "--epochs",          str(EPOCHS),\n'
-        '    "--batch-size",      str(BATCH_SIZE),\n'
+        "train_command = [sys.executable]\n"
+        "if NUM_PROCESSES > 1:\n"
+        "    train_command.extend([\n"
+        '        "-m", "torch.distributed.run", "--standalone",\n'
+        '        "--nproc_per_node", str(NUM_PROCESSES),\n'
+        '        "-m", "arena_ranker.train",\n'
+        "    ])\n"
+        "else:\n"
+        '    train_command.extend(["-m", "arena_ranker.train"])\n'
+        "\n"
+        "train_command.extend([\n"
+        '    "--data-dir", DATA_DIR,\n'
+        '    "--output-dir", OUTPUT_DIR,\n'
+        '    "--model-name", MODEL_NAME,\n'
+        '    "--epochs", str(EPOCHS),\n'
+        '    "--batch-size", str(BATCH_SIZE),\n'
         '    "--grad-accum-steps", str(GRAD_ACCUM_STEPS),\n'
-        '    "--max-length",      str(MAX_LENGTH),\n'
-        '    "--learning-rate",   str(LEARNING_RATE),\n'
-        "]\n"
+        '    "--max-length", str(MAX_LENGTH),\n'
+        '    "--learning-rate", str(LEARNING_RATE),\n'
+        "])\n"
         "\n"
         "if not USE_LORA:\n"
-        '    sys.argv.append("--disable-lora")\n'
+        '    train_command.append("--disable-lora")\n'
         "if not LOAD_IN_4BIT:\n"
-        '    sys.argv.append("--no-4bit")\n'
+        '    train_command.append("--no-4bit")\n'
+        "if FP16:\n"
+        '    train_command.append("--fp16")\n'
+        "else:\n"
+        '    train_command.append("--no-fp16")\n'
+        "if BF16:\n"
+        '    train_command.append("--bf16")\n'
+        "else:\n"
+        '    train_command.append("--no-bf16")\n'
+        "if DDP_FIND_UNUSED_PARAMETERS:\n"
+        '    train_command.append("--ddp-find-unused-parameters")\n'
+        "else:\n"
+        '    train_command.append("--no-ddp-find-unused-parameters")\n'
+        "if LOCAL_FILES_ONLY:\n"
+        '    train_command.append("--local-files-only")\n'
         "\n"
-        "from arena_ranker.train import main as train_main\n"
-        "train_main()\n"
+        "env = os.environ.copy()\n"
+        'env["PYTHONPATH"] = "/kaggle/working"\n'
+        'print("训练命令:", " ".join(shlex.quote(part) for part in train_command))\n'
+        "subprocess.run(train_command, env=env, check=True)\n"
     ))
 
     # ── Section: Inference ──
@@ -295,7 +333,7 @@ def build_cells() -> list[dict]:
         "### 步骤\n"
         "\n"
         "1. **上传模型到 Kaggle**\n"
-        "   - 在本地下载好 `Qwen/Qwen3.5-0.8B` 的完整文件\n"
+        "   - 在本地下载好 `Qwen/Qwen3-0.6B` 的完整文件\n"
         "   - 前往 [kaggle.com/models](https://kaggle.com/models) → New Model\n"
         "   - 上传模型文件夹（包含 config.json, model.safetensors 等）\n"
         "   - 或者使用 Kaggle Datasets 上传也可以\n"

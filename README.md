@@ -1,6 +1,6 @@
 # Arena Ranker
 
-基于 `Qwen3.5-0.8B` + QLoRA 的三分类微调方案，用于预测 ChatBot Arena 偏好标签：
+基于 `Qwen3-0.6B` + QLoRA 的三分类微调方案，用于预测 ChatBot Arena 偏好标签：
 
 - `winner_model_a`（A 胜）
 - `winner_model_b`（B 胜）
@@ -13,7 +13,7 @@ prompt + response_a + response_b
         ↓
   apply_chat_template (system + user)
         ↓
-  Qwen3.5-0.8B (4-bit 量化)
+  Qwen3-0.6B (4-bit 量化)
         ↓
   AutoModelForSequenceClassification
         ↓
@@ -29,7 +29,7 @@ prompt + response_a + response_b
 
 ## 主要特点
 
-- 基座模型：`Qwen/Qwen3.5-0.8B`
+- 基座模型：`Qwen/Qwen3-0.6B`
 - 量化：4-bit NF4 + double quantization
 - LoRA：r=32, alpha=64, 覆盖 attention + FFN 全部投影层
 - 分类头 (`score`) 通过 `modules_to_save` 全量训练
@@ -51,19 +51,26 @@ prompt + response_a + response_b
 
 ### Kaggle GPU 推荐参数
 
-| 参数 | 8GB 显存 | P100 16GB | T4 16GB |
+| 参数 | 8GB 显存 | P100 x1 | T4 x2 |
 | --- | --- | --- | --- |
 | `batch_size` | 1 | 2 | 2 |
-| `grad_accum_steps` | 16 | 8 | 8 |
+| `grad_accum_steps` | 16 | 8 | 4 |
 | `max_length` | 512 | 1024 | 1024 |
 | `load_in_4bit` | True | True | True |
 | `fp16` | True | True | True |
+| `bf16` | False | False | False |
 
+> **双卡 T4 说明**
+>
+> `kaggle_notebook.ipynb` 会在检测到两张 GPU 时自动使用
+> `torch.distributed.run --nproc_per_node=2` 启动双卡训练。
+> 若想保持与单卡默认配置接近的有效 batch，推荐 `batch_size=2, grad_accum_steps=4`。
+>
 > **P100 注意事项**
 >
 > P100 (Pascal, compute capability 6.0) 没有 Tensor Core，FP16 矩阵运算比 T4 慢，
 > 但仍然支持 bitsandbytes 4-bit NF4 量化和 FP16 混合精度。
-> 对于 0.8B 参数模型，VRAM 参数与 T4 相同，主要差异体现在训练速度上。
+> 对于 0.6B 参数模型，VRAM 参数与 T4 相同，主要差异体现在训练速度上。
 > **不支持 bf16**，请保持 `bf16=False`（已是默认值）。
 
 ### 离线模式
@@ -74,7 +81,7 @@ prompt + response_a + response_b
 MODEL_NAME = "/kaggle/input/<model-dataset-slug>"
 ```
 
-训练时加上 `sys.argv.append("--local-files-only")`。
+训练命令里加上 `--local-files-only`。
 
 ### 替代方案：将代码上传为 Kaggle Dataset
 
@@ -115,7 +122,7 @@ uv run arena-train
 ```
 
 默认配置：
-- 模型：`Qwen/Qwen3.5-0.8B`
+- 模型：`Qwen/Qwen3-0.6B`
 - QLoRA 4-bit 量化
 - LoRA r=32, alpha=64
 - 学习率 2e-4, cosine scheduler
@@ -183,9 +190,14 @@ uv run arena-train --config my_config.yaml
 
 ## 显存建议
 
-T4 16GB:
+T4 x2:
 ```bash
-uv run arena-train --batch-size 2 --max-length 1024
+torchrun --nproc_per_node=2 -m arena_ranker.train --batch-size 2 --grad-accum-steps 4 --max-length 1024
+```
+
+P100 16GB:
+```bash
+uv run arena-train --batch-size 2 --grad-accum-steps 8 --max-length 1024
 ```
 
 8GB 显存:

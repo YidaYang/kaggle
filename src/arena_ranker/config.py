@@ -63,7 +63,7 @@ class DataConfig:
 # ============================================================
 @dataclass(slots=True)
 class ModelConfig:
-    model_name: str = "Qwen/Qwen3.5-0.8B"
+    model_name: str = "Qwen/Qwen3-0.6B"
     cache_dir: str | None = None
     local_files_only: bool = False
     max_length: int = 1024
@@ -108,6 +108,7 @@ class TrainingConfig:
     optim: str = "paged_adamw_32bit"
     fp16: bool = True
     bf16: bool = False
+    ddp_find_unused_parameters: bool = False
     gradient_checkpointing: bool = True
     logging_steps: int = 50
     eval_strategy: str = "epoch"
