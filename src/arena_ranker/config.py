@@ -22,6 +22,11 @@ class ModelConfig:
     cache_dir: str | None = None
     local_files_only: bool = False
     max_length: int = 512
+    use_segment_budget: bool = True
+    prompt_budget: int = 192
+    response_budget: int = 384
+    response_head_tokens: int = 256
+    response_tail_tokens: int = 128
     dropout: float = 0.1
     freeze_encoder: bool = False
     use_lora: bool = True

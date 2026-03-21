@@ -49,6 +49,55 @@ def _normalize_text(value: Any, max_chars: int) -> str:
     return text[:max_chars]
 
 
+def _build_cross_encoder_text(prompt: str, response_a: str, response_b: str) -> str:
+    return (
+        "[PROMPT]\n"
+        f"{prompt}\n\n"
+        "[RESPONSE A]\n"
+        f"{response_a}\n\n"
+        "[RESPONSE B]\n"
+        f"{response_b}"
+    )
+
+
+def _decode_token_ids(tokenizer, token_ids: list[int]) -> str:
+    if not token_ids:
+        return ""
+    return tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+
+
+def _truncate_text_front(tokenizer, text: str, budget: int) -> str:
+    if budget <= 0 or not text:
+        return ""
+
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) <= budget:
+        return text
+    return _decode_token_ids(tokenizer, token_ids[:budget])
+
+
+def _truncate_text_head_tail(tokenizer, text: str, budget: int, head_tokens: int, tail_tokens: int) -> str:
+    if budget <= 0 or not text:
+        return ""
+
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) <= budget:
+        return text
+
+    head_size = min(max(head_tokens, 0), budget)
+    tail_budget = max(budget - head_size, 0)
+    tail_size = min(max(tail_tokens, 0), tail_budget)
+
+    if head_size + tail_size < budget:
+        tail_size = min(len(token_ids) - head_size, budget - head_size)
+
+    head_text = _decode_token_ids(tokenizer, token_ids[:head_size])
+    tail_text = _decode_token_ids(tokenizer, token_ids[-tail_size:]) if tail_size > 0 else ""
+    if head_text and tail_text:
+        return f"{head_text}\n...\n{tail_text}"
+    return head_text or tail_text
+
+
 def _build_target(row: pd.Series) -> int:
     for column, label_id in LABEL_TO_ID.items():
         if int(row[column]) == 1:
@@ -97,9 +146,7 @@ def _batch_encode(tokenizer, texts: list[str], max_length: int) -> dict[str, tor
 
 @dataclass(slots=True)
 class EncodedBatch:
-    prompt: dict[str, torch.Tensor]
-    response_a: dict[str, torch.Tensor]
-    response_b: dict[str, torch.Tensor]
+    inputs: dict[str, torch.Tensor]
     labels: torch.Tensor | None
     ids: list[int]
 
@@ -130,17 +177,37 @@ class ArenaCollator:
         self.tokenizer = tokenizer
         self.model_config = model_config
 
+    def _build_model_input(self, item: dict[str, Any]) -> str:
+        prompt_text = item["prompt_text"]
+        response_a_text = item["response_a_text"]
+        response_b_text = item["response_b_text"]
+
+        if self.model_config.use_segment_budget:
+            prompt_text = _truncate_text_front(self.tokenizer, prompt_text, self.model_config.prompt_budget)
+            response_a_text = _truncate_text_head_tail(
+                self.tokenizer,
+                response_a_text,
+                self.model_config.response_budget,
+                self.model_config.response_head_tokens,
+                self.model_config.response_tail_tokens,
+            )
+            response_b_text = _truncate_text_head_tail(
+                self.tokenizer,
+                response_b_text,
+                self.model_config.response_budget,
+                self.model_config.response_head_tokens,
+                self.model_config.response_tail_tokens,
+            )
+
+        return _build_cross_encoder_text(prompt_text, response_a_text, response_b_text)
+
     def __call__(self, batch: list[dict[str, Any]]) -> EncodedBatch:
-        prompt = _batch_encode(self.tokenizer, [item["prompt_text"] for item in batch], self.model_config.max_length)
-        response_a = _batch_encode(self.tokenizer, [item["response_a_text"] for item in batch], self.model_config.max_length)
-        response_b = _batch_encode(self.tokenizer, [item["response_b_text"] for item in batch], self.model_config.max_length)
+        inputs = _batch_encode(self.tokenizer, [self._build_model_input(item) for item in batch], self.model_config.max_length)
         labels = None
         if "label" in batch[0]:
             labels = torch.tensor([item["label"] for item in batch], dtype=torch.long)
         return EncodedBatch(
-            prompt=prompt,
-            response_a=response_a,
-            response_b=response_b,
+            inputs=inputs,
             labels=labels,
             ids=[item["id"] for item in batch],
         )

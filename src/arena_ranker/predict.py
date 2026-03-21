@@ -109,9 +109,7 @@ def main() -> None:
     with torch.no_grad():
         for batch in tqdm(loader, desc="predict"):
             outputs = model(
-                prompt_inputs=move_inputs_to_device(batch.prompt, device),
-                response_a_inputs=move_inputs_to_device(batch.response_a, device),
-                response_b_inputs=move_inputs_to_device(batch.response_b, device),
+                inputs=move_inputs_to_device(batch.inputs, device),
             )
             probs = normalize_probabilities(outputs.logits).cpu().numpy()
             for sample_id, prob in zip(batch.ids, probs, strict=True):

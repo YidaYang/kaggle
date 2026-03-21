@@ -28,10 +28,9 @@ class PreferenceClassifier(nn.Module):
         self.config = config
         self.encoder = load_encoder(config)
         hidden_size = self.encoder.config.hidden_size
-        classifier_input = hidden_size * 6
         self.dropout = nn.Dropout(config.dropout)
         self.classifier = nn.Sequential(
-            nn.Linear(classifier_input, hidden_size * 2),
+            nn.Linear(hidden_size, hidden_size * 2),
             nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(hidden_size * 2, 3),
@@ -83,27 +82,11 @@ class PreferenceClassifier(nn.Module):
 
     def forward(
         self,
-        prompt_inputs: dict[str, torch.Tensor],
-        response_a_inputs: dict[str, torch.Tensor],
-        response_b_inputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
         labels: torch.Tensor | None = None,
     ) -> ModelOutput:
-        prompt_emb = self.encode(prompt_inputs)
-        response_a_emb = self.encode(response_a_inputs)
-        response_b_emb = self.encode(response_b_inputs)
-
-        features = torch.cat(
-            [
-                prompt_emb,
-                response_a_emb,
-                response_b_emb,
-                response_a_emb - response_b_emb,
-                response_a_emb - prompt_emb,
-                response_b_emb - prompt_emb,
-            ],
-            dim=-1,
-        )
-        logits = self.classifier(self.dropout(features))
+        pooled = self.encode(inputs)
+        logits = self.classifier(self.dropout(pooled))
 
         loss = self.loss_fn(logits, labels) if labels is not None else None
         return ModelOutput(logits=logits, loss=loss)

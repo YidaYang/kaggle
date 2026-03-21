@@ -1,6 +1,6 @@
 # Arena Ranker
 
-基于 `Qwen` embedding encoder + 分类头的三分类方案，用于预测 ChatBot Arena 偏好标签：
+基于 `Qwen` 单塔交叉编码 + 分类头的三分类方案，用于预测 ChatBot Arena 偏好标签：
 
 - `winner_model_a`
 - `winner_model_b`
@@ -9,7 +9,8 @@
 当前实现已经支持：
 
 - 基于 `Qwen/Qwen3-Embedding-0.6B` 的 LoRA 微调
-- 8GB 显存下可运行的默认训练配置
+- 单塔交叉编码三分类
+- 可配置的分段预算截断
 - 训练过程的人性化日志输出
 - 可选上传训练指标到 `SwanLab`
 - checkpoint 恢复后生成 `submission.csv`
@@ -20,8 +21,9 @@
 
 - 基础模型：`Qwen/Qwen3-Embedding-0.6B`
 - 微调方式：默认开启 LoRA
+- 默认启用分段预算截断：`prompt=192`，`response=384(256+128)`
 - `transformers` 版本：`>=4.55.0,<5`
-- 8GB 显存默认训练参数：
+- 默认训练参数：
   - `batch_size=1`
   - `grad_accum_steps=8`
   - `max_length=512`
@@ -200,64 +202,74 @@ id,winner_model_a,winner_model_b,winner_tie
 当前模型不是生成式微调，而是一个标准的三分类判别模型。整体结构可以概括为：
 
 ```text
-prompt ------> encoder ------
-                            |
-response_a --> encoder ---- |--> 特征拼接 --> MLP classifier --> 3-class logits
-                            |
-response_b --> encoder ------
+[PROMPT]
+...
+
+[RESPONSE A]
+...
+
+[RESPONSE B]
+...
+        |
+        v
+   单个 encoder
+        |
+        v
+ masked mean pooling
+        |
+        v
+   MLP classifier
+        |
+        v
+   3-class logits
 ```
 
 ### 1. 输入编码
 
-每条样本包含三段文本：
+每条样本会先被拼成一条交叉编码文本，格式固定为：
 
-- `prompt`
-- `response_a`
-- `response_b`
+```text
+[PROMPT]
+{prompt}
 
-这三段文本会分别经过同一个 `Qwen` embedding encoder 编码，共享权重，不是三套独立模型。
+[RESPONSE A]
+{response_a}
 
-encoder 输出 `last_hidden_state` 后，代码使用 `masked mean pooling` 得到三个句向量：
+[RESPONSE B]
+{response_b}
+```
 
-- `prompt_emb`
-- `response_a_emb`
-- `response_b_emb`
+默认情况下，拼接前会先做分段预算截断：
+
+- `prompt`：保留前 `192` tokens
+- `response_a`：保留前 `256` + 后 `128` tokens
+- `response_b`：保留前 `256` + 后 `128` tokens
+
+如果你不想启用这套策略，可以通过命令行关闭：
+
+```bash
+uv run arena-train --disable-segment-budget
+```
+
+然后整条文本只经过一次 `Qwen` encoder。这样模型可以在 transformer 内部直接建模：
+
+- 问题和回答 A 的关系
+- 问题和回答 B 的关系
+- 回答 A 和回答 B 的差异
+
+encoder 输出 `last_hidden_state` 后，代码使用 `masked mean pooling` 得到一个样本级向量，再送入分类头输出三分类 logits。
 
 对应实现见：
 
-- [src/arena_ranker/modeling.py](./src/arena_ranker/modeling.py)
 - [src/arena_ranker/data.py](./src/arena_ranker/data.py)
+- [src/arena_ranker/modeling.py](./src/arena_ranker/modeling.py)
 
 ### 2. 特征构造
 
-当前分类器输入不是只拼接三个 embedding，而是构造了 6 组特征：
-
-- `prompt_emb`
-- `response_a_emb`
-- `response_b_emb`
-- `response_a_emb - response_b_emb`
-- `response_a_emb - prompt_emb`
-- `response_b_emb - prompt_emb`
-
-最终特征维度为：
+当前分类器输入是 encoder pooling 后的单个样本向量。分类头结构为：
 
 ```text
-classifier_input = hidden_size * 6
-```
-
-这种设计的目的很直接：
-
-- 保留 `prompt`、`response_a`、`response_b` 的绝对表示
-- 显式引入 `A vs B`、`A vs prompt`、`B vs prompt` 的相对差异
-
-这比只拼接三段向量更适合当前偏好比较任务。
-
-### 3. 分类头
-
-拼接后的特征会进入一个两层 MLP：
-
-```text
-Linear(hidden_size * 6, hidden_size * 2)
+Linear(hidden_size, hidden_size * 2)
 GELU
 Dropout
 Linear(hidden_size * 2, 3)
@@ -271,7 +283,7 @@ Linear(hidden_size * 2, 3)
 
 训练时使用 `CrossEntropyLoss`。
 
-### 4. LoRA 微调位置
+### 3. LoRA 微调位置
 
 当前默认开启 LoRA，LoRA 注入在 encoder 注意力层的这些模块上：
 
@@ -293,13 +305,13 @@ Linear(hidden_size * 2, 3)
 
 这也是它能在 8GB 显存下运行的关键原因之一。
 
-### 5. 训练与推理流程
+### 4. 训练与推理流程
 
 训练阶段：
 
-1. 分别编码 `prompt`、`response_a`、`response_b`
-2. 做 mean pooling 得到三个向量
-3. 拼接 6 组特征
+1. 将 `prompt`、`response_a`、`response_b` 拼成一条交叉编码文本
+2. 通过单个 encoder 编码整条输入
+3. 做 mean pooling 得到样本向量
 4. 通过 MLP 得到三分类 logits
 5. 用 `CrossEntropyLoss` 计算损失
 
@@ -309,19 +321,19 @@ Linear(hidden_size * 2, 3)
 2. 对 logits 做 `softmax`
 3. 输出三列概率到 `submission.csv`
 
-### 6. 当前架构的特点
+### 5. 当前架构的特点
 
 优点：
 
 - 结构简单，容易训练和调试
-- 明确适配 Arena 偏好比较任务
-- 比全参数微调更节省显存
+- 比独立编码后再做向量差分更贴近 Arena 偏好比较任务
+- 能直接建模 `prompt` 与两个回答之间的 token 级交互
 
 限制：
 
-- 每个样本要对三段文本各跑一次 encoder，速度不会太快
-- 当前只用了 pooling + MLP，没有更复杂的交叉注意力比较模块
-- 架构偏向稳健基线，不是专门追求 SOTA 的复杂方案
+- 输入会更长，因此 `max_length` 对效果和显存更敏感
+- 当前只用了 pooling + MLP，没有更复杂的 ranking head 或多任务目标
+- 架构仍然偏向稳健基线，不是专门追求 SOTA 的复杂方案
 
 ## 训练
 
@@ -336,6 +348,7 @@ uv run arena-train
 - 加载 `Qwen/Qwen3-Embedding-0.6B`
 - 启用 LoRA
 - 启用 gradient checkpointing
+- 启用分段预算截断
 - 将产物保存到 `artifacts/default`
 
 ### 三种训练模式
@@ -378,6 +391,23 @@ uv run arena-train --epochs 2 --batch-size 1 --grad-accum-steps 16
 
 ```bash
 uv run arena-train --max-length 384
+```
+
+调整分段预算：
+
+```bash
+uv run arena-train \
+  --max-length 1024 \
+  --prompt-budget 192 \
+  --response-budget 384 \
+  --response-head-tokens 256 \
+  --response-tail-tokens 128
+```
+
+关闭分段预算，退回统一截断：
+
+```bash
+uv run arena-train --disable-segment-budget
 ```
 
 离线加载本地模型：
@@ -453,19 +483,63 @@ uv run arena-train --disable-lora --disable-freeze-encoder
 如果你使用的是 8GB 左右显存的消费级 GPU，例如 RTX 4060 Laptop，优先从这组参数开始：
 
 ```bash
-uv run arena-train --batch-size 1 --grad-accum-steps 8 --max-length 512
+uv run arena-train \
+  --batch-size 1 \
+  --grad-accum-steps 8 \
+  --max-length 512 \
+  --prompt-budget 160 \
+  --response-budget 256 \
+  --response-head-tokens 160 \
+  --response-tail-tokens 96
 ```
 
 如果依然显存不足，继续收紧：
 
 ```bash
-uv run arena-train --batch-size 1 --grad-accum-steps 16 --max-length 384
+uv run arena-train \
+  --batch-size 1 \
+  --grad-accum-steps 16 \
+  --max-length 384 \
+  --prompt-budget 128 \
+  --response-budget 192 \
+  --response-head-tokens 128 \
+  --response-tail-tokens 64
 ```
 
 如果你遇到 CUDA 内存碎片问题，可以加上：
 
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+```
+
+### A100 建议
+
+如果你使用的是单张 A100，可以优先从这组参数开始：
+
+```bash
+uv run arena-train \
+  --batch-size 4 \
+  --grad-accum-steps 4 \
+  --max-length 1024 \
+  --prompt-budget 192 \
+  --response-budget 384 \
+  --response-head-tokens 256 \
+  --response-tail-tokens 128 \
+  --enable-swanlab
+```
+
+如果验证集指标仍然受长文本截断影响，可以继续试：
+
+```bash
+uv run arena-train \
+  --batch-size 2 \
+  --grad-accum-steps 4 \
+  --max-length 1408 \
+  --prompt-budget 256 \
+  --response-budget 512 \
+  --response-head-tokens 320 \
+  --response-tail-tokens 192 \
+  --enable-swanlab
 ```
 
 ### 训练日志
@@ -476,8 +550,9 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 20:57:45 | INFO | 训练启动
 20:57:45 | INFO | 设备: NVIDIA GeForce RTX 4060 Laptop GPU (7.6 GB)
 20:57:45 | INFO | 数据集: train=51729, valid=5748, batch_size=1, grad_accum=8, epochs=1
-20:57:45 | INFO | 模型: Qwen/Qwen3-Embedding-0.6B | max_length=512 | LoRA=on | gradient_checkpointing=on
+20:57:45 | INFO | 模型: Qwen/Qwen3-Embedding-0.6B | max_length=512 | freeze_encoder=off | LoRA=on | gradient_checkpointing=on | segment_budget=on
 20:57:45 | INFO | LoRA 配置: r=16, alpha=32, dropout=0.050, target_modules=q_proj,k_proj,v_proj,o_proj
+20:57:45 | INFO | 分段预算: prompt=192 | response=384 | response_head=256 | response_tail=128
 20:57:45 | INFO | 优化步数: total=6467, warmup=646
 20:57:45 | INFO | 输出目录: artifacts/default
 ```
@@ -497,17 +572,16 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 最小用法：
 
 ```bash
-uv run arena-train --classifier-only --enable-swanlab
+uv run arena-train --enable-swanlab
 ```
 
 指定项目名和实验名：
 
 ```bash
 uv run arena-train \
-  --classifier-only \
   --enable-swanlab \
   --swanlab-project "arena-ranker" \
-  --swanlab-experiment-name "classifier-only-baseline"
+  --swanlab-experiment-name "cross-encoder-baseline"
 ```
 
 如果你需要上传到指定工作空间，也可以补充：
@@ -569,7 +643,7 @@ uv run arena-predict \
 主要分四部分：
 
 - `DataConfig`：数据路径、文本截断长度、验证集比例
-- `ModelConfig`：模型名、最大长度、LoRA 参数
+- `ModelConfig`：模型名、最大长度、分段预算、LoRA 参数
 - `TrainingConfig`：输出目录、学习率、batch、epoch、梯度累积、AMP、gradient checkpointing
 - `SwanlabConfig`：是否启用上传、项目名、实验名、workspace、运行模式
 
@@ -617,7 +691,8 @@ uv sync
 
 原因很直接：
 
-- 每个样本会分别编码 `prompt`、`response_a`、`response_b`
+- 每个样本会把 `prompt`、`response_a`、`response_b` 拼成一条更长的交叉编码输入
+- 默认还会做分段预算和回答首尾截断，这会额外增加 collator 阶段的 tokenizer 开销
 - 为了适配 8GB 显存，默认启用了更保守的 batch 和 gradient checkpointing
 
 如果你更关心速度而不是显存，可以尝试：
@@ -632,12 +707,13 @@ uv sync
 
 - 不引入 Trainer
 - 不做多折训练
-- 不做复杂特征工程
+- 不做滑窗聚合或多阶段重排
 - 不做额外实验管理系统
 
 这符合当前项目的 KISS 和 YAGNI 目标。如果你后续要继续扩展，建议优先做这些事情：
 
-- 只保存 LoRA adapter 和分类头，减少 checkpoint 体积
+- 增加分段预算的 YAML 示例配置
+- 增加长文本滑窗聚合实验
 - 增加验证集更细粒度的指标输出
 - 增加显存和吞吐量日志
 - 增加基础测试

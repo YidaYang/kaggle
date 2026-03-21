@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=None)
     parser.add_argument("--max-length", type=int, default=None)
+    parser.add_argument("--segment-budget", dest="use_segment_budget", action="store_true")
+    parser.add_argument("--disable-segment-budget", dest="use_segment_budget", action="store_false")
+    parser.add_argument("--prompt-budget", type=int, default=None)
+    parser.add_argument("--response-budget", type=int, default=None)
+    parser.add_argument("--response-head-tokens", type=int, default=None)
+    parser.add_argument("--response-tail-tokens", type=int, default=None)
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--freeze-encoder", dest="freeze_encoder", action="store_true")
@@ -56,7 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swanlab-experiment-name", type=str, default=None)
     parser.add_argument("--swanlab-workspace", type=str, default=None)
     parser.add_argument("--swanlab-mode", type=str, default=None)
-    parser.set_defaults(use_lora=None, gradient_checkpointing=None, freeze_encoder=None, enable_swanlab=None)
+    parser.set_defaults(
+        use_lora=None,
+        gradient_checkpointing=None,
+        freeze_encoder=None,
+        enable_swanlab=None,
+        use_segment_budget=None,
+    )
     return parser.parse_args()
 
 
@@ -73,6 +85,16 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
         config.training.grad_accum_steps = args.grad_accum_steps
     if args.max_length is not None:
         config.model.max_length = args.max_length
+    if args.use_segment_budget is not None:
+        config.model.use_segment_budget = args.use_segment_budget
+    if args.prompt_budget is not None:
+        config.model.prompt_budget = args.prompt_budget
+    if args.response_budget is not None:
+        config.model.response_budget = args.response_budget
+    if args.response_head_tokens is not None:
+        config.model.response_head_tokens = args.response_head_tokens
+    if args.response_tail_tokens is not None:
+        config.model.response_tail_tokens = args.response_tail_tokens
     if args.cache_dir is not None:
         config.model.cache_dir = args.cache_dir
     if args.local_files_only:
@@ -182,13 +204,22 @@ def log_run_summary(config: AppConfig, device: torch.device, train_size: int, va
         config.training.epochs,
     )
     LOGGER.info(
-        "模型: %s | max_length=%s | freeze_encoder=%s | LoRA=%s | gradient_checkpointing=%s",
+        "模型: %s | max_length=%s | freeze_encoder=%s | LoRA=%s | gradient_checkpointing=%s | segment_budget=%s",
         config.model.model_name,
         config.model.max_length,
         "on" if config.model.freeze_encoder else "off",
         "on" if config.model.use_lora else "off",
         "on" if config.training.gradient_checkpointing else "off",
+        "on" if config.model.use_segment_budget else "off",
     )
+    if config.model.use_segment_budget:
+        LOGGER.info(
+            "分段预算: prompt=%s | response=%s | response_head=%s | response_tail=%s",
+            config.model.prompt_budget,
+            config.model.response_budget,
+            config.model.response_head_tokens,
+            config.model.response_tail_tokens,
+        )
     if config.model.use_lora:
         LOGGER.info(
             "LoRA 配置: r=%s, alpha=%s, dropout=%.3f, target_modules=%s",
@@ -214,9 +245,7 @@ def evaluate(model, loader, device) -> dict[str, float]:
     with torch.no_grad():
         for batch in tqdm(loader, desc="valid", leave=False):
             outputs = model(
-                prompt_inputs=move_inputs_to_device(batch.prompt, device),
-                response_a_inputs=move_inputs_to_device(batch.response_a, device),
-                response_b_inputs=move_inputs_to_device(batch.response_b, device),
+                inputs=move_inputs_to_device(batch.inputs, device),
                 labels=batch.labels.to(device) if batch.labels is not None else None,
             )
             probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
@@ -327,9 +356,7 @@ def main() -> None:
             for step, batch in enumerate(progress, start=1):
                 with torch.amp.autocast(device_type=device.type, enabled=config.training.amp and device.type == "cuda"):
                     outputs = model(
-                        prompt_inputs=move_inputs_to_device(batch.prompt, device),
-                        response_a_inputs=move_inputs_to_device(batch.response_a, device),
-                        response_b_inputs=move_inputs_to_device(batch.response_b, device),
+                        inputs=move_inputs_to_device(batch.inputs, device),
                         labels=batch.labels.to(device) if batch.labels is not None else None,
                     )
                     loss = outputs.loss / config.training.grad_accum_steps
