@@ -11,6 +11,7 @@
 - 基于 `Qwen/Qwen3-Embedding-0.6B` 的 LoRA 微调
 - 8GB 显存下可运行的默认训练配置
 - 训练过程的人性化日志输出
+- 可选上传训练指标到 `SwanLab`
 - checkpoint 恢复后生成 `submission.csv`
 
 项目定位很直接：保持训练链路简单，不引入额外训练框架，在当前代码结构上完成可训练、可预测、可调参的最小实现。
@@ -60,6 +61,13 @@ uv sync
 export https_proxy="http://127.0.0.1:7890"
 export http_proxy="http://127.0.0.1:7890"
 export all_proxy="socks5://127.0.0.1:7890"
+```
+
+如果你要使用 `SwanLab`，同步依赖后再登录：
+
+```bash
+uv sync
+uv run swanlab login
 ```
 
 ## 数据格式
@@ -482,6 +490,45 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 - epoch 耗时
 - 是否刷新最佳结果
 
+### SwanLab 上传
+
+项目现在支持把训练指标上传到 `SwanLab`。默认关闭，只有显式开启时才会初始化，避免影响原有训练链路。
+
+最小用法：
+
+```bash
+uv run arena-train --classifier-only --enable-swanlab
+```
+
+指定项目名和实验名：
+
+```bash
+uv run arena-train \
+  --classifier-only \
+  --enable-swanlab \
+  --swanlab-project "arena-ranker" \
+  --swanlab-experiment-name "classifier-only-baseline"
+```
+
+如果你需要上传到指定工作空间，也可以补充：
+
+```bash
+uv run arena-train \
+  --enable-swanlab \
+  --swanlab-workspace "your-workspace"
+```
+
+训练过程中会上传这些指标：
+
+- `train/loss`
+- `train/avg_loss`
+- `train/lr`
+- `epoch/train_loss`
+- `epoch/valid_accuracy`
+- `epoch/valid_log_loss`
+- `best/accuracy`
+- `best/log_loss`
+
 ### 训练产物
 
 默认输出目录为 `artifacts/default`，会生成：
@@ -519,11 +566,12 @@ uv run arena-predict \
 
 配置定义在 [src/arena_ranker/config.py](./src/arena_ranker/config.py)。
 
-主要分三部分：
+主要分四部分：
 
 - `DataConfig`：数据路径、文本截断长度、验证集比例
 - `ModelConfig`：模型名、最大长度、LoRA 参数
 - `TrainingConfig`：输出目录、学习率、batch、epoch、梯度累积、AMP、gradient checkpointing
+- `SwanlabConfig`：是否启用上传、项目名、实验名、workspace、运行模式
 
 如果你已经有自己的 YAML 配置，可以通过：
 

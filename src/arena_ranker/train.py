@@ -20,6 +20,7 @@ from arena_ranker.config import AppConfig, load_config
 from arena_ranker.data import ArenaCollator, ArenaPreferenceDataset, split_train_valid, load_train_dataframe
 from arena_ranker.hf import load_tokenizer
 from arena_ranker.modeling import PreferenceClassifier
+from arena_ranker.swanlab_utils import SwanlabTracker
 
 
 LOGGER = logging.getLogger("arena_ranker.train")
@@ -49,7 +50,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=None)
     parser.add_argument("--lora-bias", type=str, default=None)
     parser.add_argument("--lora-target-modules", type=str, nargs="+", default=None)
-    parser.set_defaults(use_lora=None, gradient_checkpointing=None, freeze_encoder=None)
+    parser.add_argument("--enable-swanlab", dest="enable_swanlab", action="store_true")
+    parser.add_argument("--disable-swanlab", dest="enable_swanlab", action="store_false")
+    parser.add_argument("--swanlab-project", type=str, default=None)
+    parser.add_argument("--swanlab-experiment-name", type=str, default=None)
+    parser.add_argument("--swanlab-workspace", type=str, default=None)
+    parser.add_argument("--swanlab-mode", type=str, default=None)
+    parser.set_defaults(use_lora=None, gradient_checkpointing=None, freeze_encoder=None, enable_swanlab=None)
     return parser.parse_args()
 
 
@@ -90,6 +97,16 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
         config.model.lora_bias = args.lora_bias
     if args.lora_target_modules is not None:
         config.model.lora_target_modules = args.lora_target_modules
+    if args.enable_swanlab is not None:
+        config.swanlab.enabled = args.enable_swanlab
+    if args.swanlab_project is not None:
+        config.swanlab.project = args.swanlab_project
+    if args.swanlab_experiment_name is not None:
+        config.swanlab.experiment_name = args.swanlab_experiment_name
+    if args.swanlab_workspace is not None:
+        config.swanlab.workspace = args.swanlab_workspace
+    if args.swanlab_mode is not None:
+        config.swanlab.mode = args.swanlab_mode
     return config
 
 
@@ -186,6 +203,7 @@ def log_run_summary(config: AppConfig, device: torch.device, train_size: int, va
         LOGGER.info("当前进行全参数微调，encoder 和分类头都会参与训练。")
     LOGGER.info("优化步数: total=%s, warmup=%s", total_steps, int(total_steps * config.training.warmup_ratio))
     LOGGER.info("输出目录: %s", config.training.output_dir)
+    LOGGER.info("SwanLab: %s", "on" if config.swanlab.enabled else "off")
 
 
 def evaluate(model, loader, device) -> dict[str, float]:
@@ -290,62 +308,95 @@ def main() -> None:
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=config.training.amp and device.type == "cuda")
     log_run_summary(config, device, len(train_split), len(valid_split), total_steps)
+    tracker = SwanlabTracker(config)
+    tracker.start()
 
     best_metrics = {"accuracy": 0.0, "log_loss": float("inf")}
     best_state = None
     training_started_at = time.perf_counter()
+    global_step = 0
 
-    for epoch in range(config.training.epochs):
-        epoch_started_at = time.perf_counter()
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        progress = tqdm(train_loader, desc=f"train epoch {epoch + 1}/{config.training.epochs}")
-        running_loss = 0.0
+    try:
+        for epoch in range(config.training.epochs):
+            epoch_started_at = time.perf_counter()
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            progress = tqdm(train_loader, desc=f"train epoch {epoch + 1}/{config.training.epochs}")
+            running_loss = 0.0
 
-        for step, batch in enumerate(progress, start=1):
-            with torch.amp.autocast(device_type=device.type, enabled=config.training.amp and device.type == "cuda"):
-                outputs = model(
-                    prompt_inputs=move_inputs_to_device(batch.prompt, device),
-                    response_a_inputs=move_inputs_to_device(batch.response_a, device),
-                    response_b_inputs=move_inputs_to_device(batch.response_b, device),
-                    labels=batch.labels.to(device) if batch.labels is not None else None,
-                )
-                loss = outputs.loss / config.training.grad_accum_steps
+            for step, batch in enumerate(progress, start=1):
+                with torch.amp.autocast(device_type=device.type, enabled=config.training.amp and device.type == "cuda"):
+                    outputs = model(
+                        prompt_inputs=move_inputs_to_device(batch.prompt, device),
+                        response_a_inputs=move_inputs_to_device(batch.response_a, device),
+                        response_b_inputs=move_inputs_to_device(batch.response_b, device),
+                        labels=batch.labels.to(device) if batch.labels is not None else None,
+                    )
+                    loss = outputs.loss / config.training.grad_accum_steps
 
-            batch_loss = loss.item() * config.training.grad_accum_steps
-            running_loss += batch_loss
-            scaler.scale(loss).backward()
+                batch_loss = loss.item() * config.training.grad_accum_steps
+                running_loss += batch_loss
+                scaler.scale(loss).backward()
 
-            if step % config.training.grad_accum_steps == 0 or step == len(train_loader):
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+                if step % config.training.grad_accum_steps == 0 or step == len(train_loader):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
+                    global_step += 1
+                    tracker.log(
+                        {
+                            "train/loss": batch_loss,
+                            "train/avg_loss": running_loss / step,
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/epoch": epoch + 1,
+                        },
+                        step=global_step,
+                    )
 
-            if step % config.training.log_every == 0 or step == len(train_loader):
-                avg_loss = running_loss / step
-                progress.set_postfix(loss=f"{batch_loss:.4f}", avg_loss=f"{avg_loss:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+                if step % config.training.log_every == 0 or step == len(train_loader):
+                    avg_loss = running_loss / step
+                    progress.set_postfix(loss=f"{batch_loss:.4f}", avg_loss=f"{avg_loss:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
-        metrics = evaluate(model, valid_loader, device)
-        avg_epoch_loss = running_loss / max(len(train_loader), 1)
-        epoch_duration = format_seconds(time.perf_counter() - epoch_started_at)
-        LOGGER.info(
-            "Epoch %s/%s 完成 | train_loss=%.4f | valid_accuracy=%.4f | valid_log_loss=%.4f | 耗时=%s",
-            epoch + 1,
-            config.training.epochs,
-            avg_epoch_loss,
-            metrics["accuracy"],
-            metrics["log_loss"],
-            epoch_duration,
-        )
-        if metrics["log_loss"] < best_metrics["log_loss"]:
-            best_metrics = metrics
-            best_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+            metrics = evaluate(model, valid_loader, device)
+            avg_epoch_loss = running_loss / max(len(train_loader), 1)
+            epoch_duration = format_seconds(time.perf_counter() - epoch_started_at)
             LOGGER.info(
-                "刷新最佳结果 | valid_accuracy=%.4f | valid_log_loss=%.4f",
-                best_metrics["accuracy"],
-                best_metrics["log_loss"],
+                "Epoch %s/%s 完成 | train_loss=%.4f | valid_accuracy=%.4f | valid_log_loss=%.4f | 耗时=%s",
+                epoch + 1,
+                config.training.epochs,
+                avg_epoch_loss,
+                metrics["accuracy"],
+                metrics["log_loss"],
+                epoch_duration,
             )
+            tracker.log(
+                {
+                    "epoch/train_loss": avg_epoch_loss,
+                    "epoch/valid_accuracy": metrics["accuracy"],
+                    "epoch/valid_log_loss": metrics["log_loss"],
+                    "epoch/index": epoch + 1,
+                },
+                step=global_step,
+            )
+            if metrics["log_loss"] < best_metrics["log_loss"]:
+                best_metrics = metrics
+                best_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+                LOGGER.info(
+                    "刷新最佳结果 | valid_accuracy=%.4f | valid_log_loss=%.4f",
+                    best_metrics["accuracy"],
+                    best_metrics["log_loss"],
+                )
+                tracker.log(
+                    {
+                        "best/accuracy": best_metrics["accuracy"],
+                        "best/log_loss": best_metrics["log_loss"],
+                        "best/epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
+    finally:
+        tracker.finish()
 
     if best_state is not None:
         model.load_state_dict(best_state)

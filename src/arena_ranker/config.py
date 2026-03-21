@@ -53,10 +53,20 @@ class TrainingConfig:
 
 
 @dataclass(slots=True)
+class SwanlabConfig:
+    enabled: bool = False
+    project: str = "arena-ranker"
+    experiment_name: str | None = None
+    workspace: str | None = None
+    mode: str | None = None
+
+
+@dataclass(slots=True)
 class AppConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    swanlab: SwanlabConfig = field(default_factory=SwanlabConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -76,4 +86,5 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         data=DataConfig(**raw.get("data", {})),
         model=ModelConfig(**raw.get("model", {})),
         training=TrainingConfig(**raw.get("training", {})),
+        swanlab=SwanlabConfig(**raw.get("swanlab", {})),
     )
