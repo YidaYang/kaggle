@@ -161,6 +161,7 @@ def build_cells() -> list[dict]:
         "\n"
         "双 T4 会自动走分布式双卡训练；P100 保持单卡训练。\n"
         "T4 不支持 bf16，因此默认保持 `BF16 = False`。\n"
+        "当前 Kaggle 环境下，多进程双卡训练默认关闭 `LOAD_IN_4BIT`，避免 4-bit 模型加载卡住。\n"
         "若 notebook 当前可见两张 GPU 但你强制改成单进程，会自动只暴露 `cuda:0`，避免 Trainer 误退回 DataParallel。"
     ))
     cells.append(make_code(
@@ -177,7 +178,7 @@ def build_cells() -> list[dict]:
         "MAX_LENGTH       = 1024     # T4/P100 16GB 推荐 1024\n"
         "LEARNING_RATE    = 2e-4\n"
         "USE_LORA         = True\n"
-        "LOAD_IN_4BIT     = True     # QLoRA 4-bit 量化\n"
+        "LOAD_IN_4BIT     = True     # 单卡默认开启；双卡会在运行时自动关闭\n"
         "FP16             = True     # T4 Tensor Cores 建议开启\n"
         "BF16             = False    # T4 不支持 bf16，请保持关闭\n"
         "DDP_FIND_UNUSED_PARAMETERS = False\n"
@@ -271,6 +272,11 @@ def build_cells() -> list[dict]:
         "import subprocess\n"
         "import sys\n"
         "\n"
+        "load_in_4bit_runtime = LOAD_IN_4BIT\n"
+        "if NUM_PROCESSES > 1 and load_in_4bit_runtime:\n"
+        "    load_in_4bit_runtime = False\n"
+        '    print("检测到双卡训练: 已自动关闭 LOAD_IN_4BIT，改用 LoRA + FP16 + DDP")\n'
+        "\n"
         "train_command = [sys.executable]\n"
         "if NUM_PROCESSES > 1:\n"
         "    train_command.extend([\n"
@@ -294,7 +300,7 @@ def build_cells() -> list[dict]:
         "\n"
         "if not USE_LORA:\n"
         '    train_command.append("--disable-lora")\n'
-        "if not LOAD_IN_4BIT:\n"
+        "if not load_in_4bit_runtime:\n"
         '    train_command.append("--no-4bit")\n'
         "if FP16:\n"
         '    train_command.append("--fp16")\n'

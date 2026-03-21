@@ -56,7 +56,7 @@ prompt + response_a + response_b
 | `batch_size` | 1 | 2 | 2 |
 | `grad_accum_steps` | 16 | 8 | 4 |
 | `max_length` | 512 | 1024 | 1024 |
-| `load_in_4bit` | True | True | True |
+| `load_in_4bit` | True | True | False |
 | `fp16` | True | True | True |
 | `bf16` | False | False | False |
 
@@ -65,6 +65,8 @@ prompt + response_a + response_b
 > `kaggle_notebook.ipynb` 会在检测到两张 GPU 时自动使用
 > `torch.distributed.run --nproc_per_node=2` 启动双卡训练。
 > 若想保持与单卡默认配置接近的有效 batch，推荐 `batch_size=2, grad_accum_steps=4`。
+> 当前 Kaggle 环境下，双卡多进程 + bitsandbytes 4-bit 容易在模型加载阶段卡住，
+> 因此 notebook 会在双卡训练时自动关闭 `LOAD_IN_4BIT`，改用 LoRA + FP16 + DDP。
 > notebook 还会先把远程模型预下载到 `/kaggle/working`，再切换到本地只读加载，
 > 以减少双进程并发拉取模型导致的卡顿。
 >

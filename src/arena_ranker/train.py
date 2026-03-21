@@ -207,6 +207,13 @@ def validate_parallelism_config(config: AppConfig) -> None:
     """提前拦截已知不兼容的并行配置，避免 Trainer 落到 DataParallel。"""
     visible_gpu_count = get_visible_gpu_count()
     world_size = get_world_size()
+    if config.model.load_in_4bit and world_size > 1:
+        raise RuntimeError(
+            "检测到多进程多卡训练且启用了 bitsandbytes 4-bit / QLoRA。"
+            "当前 Kaggle 环境下，这个组合容易在模型加载阶段卡住。"
+            "请在双卡训练时关闭 4-bit（传入 --no-4bit），"
+            "改用 LoRA + FP16 + DDP；若必须使用 4-bit，请改回单卡训练。"
+        )
     if config.model.load_in_4bit and world_size == 1 and visible_gpu_count > 1:
         raise RuntimeError(
             "检测到单进程训练，但当前可见 GPU 数量大于 1。"
